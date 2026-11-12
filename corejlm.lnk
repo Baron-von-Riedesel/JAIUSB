@@ -1,0 +1,7 @@
+format win pe hx dll runtime native
+option nodefaultlibs, quiet, map=bjlm/core.map
+library %WATCOM%/lib386/dos/clib3r.lib
+file bjlm/jlment.obj
+file bjlm/platjlm.obj
+file bjlm/winlib.obj
+lib  bjlm/core.lib
