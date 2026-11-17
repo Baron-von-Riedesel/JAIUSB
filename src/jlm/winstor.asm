@@ -1,4 +1,4 @@
-; winstor.asm -  JAIUSB.SYS: DOS block device driver front end of the
+; winstor.asm - JAIUSB.SYS: DOS block device driver front end of the
 ; 32-bit JLM JAIUCORE.DLL
 ;
 ; Resident part: device header, strategy/interrupt, control block (CB)
@@ -24,8 +24,14 @@ _DATA ends
 
 WINAWARE equ 0	;1=check Win3/Win9x startup/exit and support int 33h
 WIN30    equ 0	;1=support for Win 3.0 DOSX
-?STKRQ   equ 0	;1=stack switch on DOS request 
-?STKIRQ  equ 0	;1=stack switch on IRQs
+?STKRQ   equ 0	;1=stack switch on DOS request (no switch if stack's in use)
+?STKIRQ  equ 0	;1=stack switch on IRQs (disables reentrancy)
+PROCESSKQ equ 0	;1=process KQ in irq 1/12
+DEFERRED equ 0	;1=defer IRQs if status is unsafe
+TPMODE   equ 0	;1=support touchpad mode for irq 12
+POLLV86  equ 0	;1=poll in v86-mode
+PROTI13  equ 0	;1=protect int 13h
+IRQX     equ 0	;1=handle USB interrupts in v86-mode
 
 ifdef PKG_USB
 WIN_USB equ <>	;needed by winapi.inc
@@ -35,7 +41,7 @@ endif
 ifdef PKG_USB
 DRVNAME    equ  'JAIUSB'
 HDRNAME    equ  'JAIUSB '
-BANNER     equ  'JAIUSB 1.0 - USB driver for DOS with Jemm'
+BANNER     equ  'JAIUSB 1.1 - USB driver for DOS with Jemm'
 COREFILE   equ  'JAIUCORE.DLL'
 VXDFILE    equ  'JAIUSB.386'
 DOSACTIVE  equ  'USB active'
@@ -44,7 +50,7 @@ DEFSLOTS   equ 4
 CORE_POOL  equ 3584 * 1024             ; camera frames and their isochronous buffers (core window: 4 MB)
 elseifdef PKG_AUDIO ; pretty useless for DOS since no port trapping
 DRVNAME    equ  'JAIAUDIO'
-BANNER     equ  'JAIAUDIO 1.0 - HD Audio / AC97 sound driver for Windows 3.0-3.11'
+BANNER     equ  'JAIAUDIO 1.1 - HD Audio / AC97 sound driver'
 COREFILE   equ  'JAIACORE.DLL'
 VXDFILE    equ  'JAIAUDIO.386'
 DOSACTIVE  equ  'sound active in DOS / standard mode'
@@ -55,7 +61,7 @@ else
 PKG_DISK   equ <>
 DRVNAME    equ  'JAIDISK'
 HDRNAME    equ  'JAIDISK'
-BANNER     equ  'JAIDISK 1.0 - IDE/AHCI/NVMe disk driver for DOS'
+BANNER     equ  'JAIDISK 1.1 - IDE/AHCI/NVMe disk driver for DOS'
 COREFILE   equ  'JAIDCORE.DLL'
 VXDFILE    equ  'JAIDISK.386'
 DOSACTIVE  equ  'active'
@@ -103,26 +109,50 @@ endif
 ; ---------------------------------------------------------------------------
 ; resident data
 reqptr          dd 0	;DOS request header
-old2f           dd 0	;old real-mode interrupts
+
+;--- oldvecs must match order of hooks
+oldvecs label dword
+
+ifdef PKG_USB
+ if POLLV86
 old08           dd 0
-old09           dd 0
-old74           dd 0
-old15           dd 0
-old13           dd 0
 old28           dd 0
+ endif
+ if PROCESSKQ
+old09           dd 0
+ endif
+ if TPMODE or PROCESSKQ
+old74           dd 0
+ endif
+old15           dd 0
+ if PROTI13
+old13           dd 0
+ endif
+old2f           dd 0
+else
+old08           dd 0
+old28           dd 0
+old13           dd 0
+ ifdef PKG_DISK
+old13d          dd 0
+ endif
+old2f           dd 0
+endif
+
+if IRQX
 oldirq          dd 16 dup(0)
-xmsentry        dd 0	;XMS driver entry
-drv_lin         dd 0	;linear address of driver header
 irqchain        dd 0	;core's return value for FN_IRQ
+endif
+xmsentry        dd 0	;XMS driver entry
 jlmentry        dd 0
 emb_handle      dw 0
-
-busy            db 0	;core's busy
-core_ok         db 0	;core loaded and status ok
+if PROCESSKQ
+pkq_drain       dw offset kq_drain
+endif
 if WINAWARE
 handover        db 0	; Windows enhanced mode owns the hardware
 endif
-dos_usb         db 0	;USB polling?
+;dos_usb         db 0	;USB in DOS? Always active!
 ;mplex           db WIN_MPLEX
 ;tickdiv         db 0	;
 
@@ -183,7 +213,6 @@ cbx             wincbx <>
 
 ifdef PKG_DISK
 
-old13d          dd 0
 old4b           dd 0
 vds_ret         dd 0
 vds_active      db 0
@@ -191,30 +220,34 @@ ebda_saved      db 0
 ebda_buf        db 6Ch dup (0)
 endif ;PKG_DISK
 
+if DEFERRED
 irq_deferred    dw 0            ; IRQs masked until the next safe poll
+endif
+if PROTI13
 in13            db 0            ; nesting of BIOS disk calls
+endif
 auxdeliv        db 0
-                align 4
-indos_ptr       dd 0            ; DOS InDOS flag (critical error flag at -1)
-if ?STKRQ
-rq_stack        db 1024 dup (0)
-rq_stack_top  equ $
-endif
 if ?STKIRQ
-irq_stack       db 1024 dup (0)
-irq_stack_top equ $
-endif
-if ?STKRQ
-rq_sp           dw 0
-rq_ss           dw 0
-endif
-if ?STKIRQ
-irq_sp          dw 0
-irq_ss          dw 0
 irq_onstk       db 0
 endif
 if ?STKRQ
 rq_onstk        db 0
+endif
+                align 4
+if DEFERRED or TPMODE
+indos_ptr       dd 0            ; DOS InDOS flag (critical error flag at -1)
+endif
+if ?STKRQ
+rq_stack        db 1024 dup (0)
+rq_stack_top  equ $
+rq_sp           dw 0
+rq_ss           dw 0
+endif
+if ?STKIRQ
+irq_stack       db 1024 dup (0)
+irq_stack_top equ $
+irq_sp          dw 0
+irq_ss          dw 0
 endif
 
 resident_end label byte
@@ -238,8 +271,6 @@ RPSeg	dw ?	;+16 (Segment must ALWAYS be set!).
 RPCL	dd ?	;+18 Command-line and BPB pointer.
 RPDN	db ?	;+22 Drive number (0 = A: etc.).
 RP ends
-
-
 
 interrupt proc
 if ?STKRQ        
@@ -269,9 +300,8 @@ endif
 if ?STKRQ
         sti
 endif        
-        push ds
         push es
-        pushad
+        push bx
         les bx, [cs:reqptr]
         cmp [es:bx].RP.RPOp, 0
         jne .notinit
@@ -283,15 +313,13 @@ endif
         jmp .done
 .blockreq:
 if WINAWARE
-        test word ptr [cs:cb.flags], CBF_VXD
+        test byte ptr [cs:cb.flags], CBF_VXD
         jnz .vxd
-endif        
-        cmp [cs:core_ok], 1
-        jne .fail
-if WINAWARE
         cmp [cs:handover], 0
         jne .fail
-endif        
+endif
+        push eax
+        push ebx
         mov ax, es
         movzx eax, ax
         shl eax, 4
@@ -300,13 +328,17 @@ endif
         mov ax, FN_DOS
         call callcore
         cmp eax, -1
+        pop ebx
+        pop eax
         je .fail
         jmp .done
 if WINAWARE
 .vxd:
+        push ax
         xor ax, ax
         call [cs:cb.vxd_entry]
         cmp ax, 0FFFFh
+        pop ax
         je .fail
         jmp .done
 endif
@@ -314,23 +346,22 @@ endif
         les bx, [cs:reqptr]
         mov [es:bx].RP.RPStat, 810Ch       ; error, done, general failure
 .done:
-        call kq_drain  ;no register modified
-        popad
+if PROCESSKQ
+        call [cs:pkq_drain]	;DOS driver interrupt proc
+endif        
+        pop bx
         pop es
-        pop ds
         ret
 interrupt endp
 
 ; ---------------------------------------------------------------------------
 ; callcore: EAX = function index, EBX = argument. Returns EAX (-1 if busy/unavailable).
 callcore proc
-        cmp [cs:busy], 0
+        test byte ptr [cs:cb.flags], CBF_BUSY
         jne .busy
-        cmp [cs:core_ok], 1
-        jne .busy
-        mov [cs:busy], 1
+;        or byte ptr [cs:cb.flags], CBF_BUSY
         call [cs:jlmentry]
-        mov [cs:busy], 0
+;        and byte ptr [cs:cb.flags], not CBF_BUSY
         ret
 .busy:
         mov eax, -1
@@ -338,6 +369,7 @@ callcore proc
 
 callcore endp
 
+if PROCESSKQ
 ; ---------------------------------------------------------------------------
 ; 8042 injection queue drain (USB keyboard/mouse in DOS and standard mode)
 ; no register modified.
@@ -353,11 +385,10 @@ kq_drain proc
         jnz .x
         xor bh, bh
         shl bx, 1
-;        mov ax, [cs:cb+CB_KQ+bx]
         mov ax, cs:[bx+cb.kq]
         xchg al, ah
         out 64h, al
-        mov cx, 4000
+        mov cx, 10000
 .w:     in al, 64h
         test al, 02h
         loopnz .w
@@ -365,7 +396,8 @@ kq_drain proc
         out 60h, al
         mov al, [cs:cb.kq_tail]
         inc al
-        cmp al, WIN_KQLEN
+;        cmp al, WIN_KQLEN
+        cmp al, lengthof wincb.kq
         jb .s
         xor al, al
 .s:     mov [cs:cb.kq_tail], al
@@ -374,6 +406,7 @@ kq_drain proc
         pop ax
         ret
 kq_drain endp
+endif
 
 ; ---------------------------------------------------------------------------
 ; INT 15h: track the BIOS pointing device state, so mouse packets are injected into
@@ -464,12 +497,8 @@ endif
         jne .n3
         push ds
         push ebx
-        push ecx
-        push edx
-        push esi
-        push edi
 if WINAWARE
-        test word ptr [cs:cb.flags], CBF_VXD
+        test byte ptr [cs:cb.flags], CBF_VXD
         jz .apicore
         mov ax, 1
         call [cs:cb.vxd_entry]
@@ -484,27 +513,30 @@ endif
         mov ax, FN_API
         call callcore
 .apiret:
-        pop edi
-        pop esi
-        pop edx
-        pop ecx
         pop ebx
         pop ds
         iret
-.n3:    cmp al, 03h                     ; BL bit 0: 4-byte wheel packets, bit 1: WINMOUSE reads the aux
+.n3:
+        cmp al, 03h                     ; BL bit 0: 4-byte wheel packets, bit 1: WINMOUSE reads the aux
         jne .n4                         ; port, bit 2: WINMOUSE reads the mouse mailbox
         and word ptr [cs:cb.flags], not (CBF_WHEEL4 or CBF_AUXWIN or CBF_MBOX)
+if WINAWARE
         test bl, 4
         jz .r3a
         or word ptr [cs:cb.flags], CBF_MBOX
 .r3a:
+endif
         test bl, 1
         jz .r3
         or word ptr [cs:cb.flags], CBF_WHEEL4
-.r3:    test bl, 2
+.r3:
+if WINAWARE
+        test bl, 2
         jz .r3b
         or word ptr [cs:cb.flags], CBF_AUXWIN
-.r3b:   xor ax, ax
+.r3b:
+endif
+        xor ax, ax
         iret
 .n4:    mov ax, 0FFFFh
         iret
@@ -517,8 +549,8 @@ if WINAWARE
         call [cs:old2f]
         test cx, cx
         jnz .wsret
-        cmp [cs:core_ok], 1
-        jne .wsret
+;        cmp [cs:is_busy], 0
+;        jne .wsret
         pushad
 ;        push ds
 ;        push es
@@ -787,29 +819,24 @@ int33 proc
 int33 endp
 endif
 ; ---------------------------------------------------------------------------
+if POLLV86
 ; timer: drive the DOS-mode USB stack
 int08 proc
         pushf
         call [cs:old08]
-        call dos_safe
-        jc .x
         call do_poll
-.x:     iret
+        iret
 int08 endp
 
 ; DOS idle: DOS is waiting for console input and may be interrupted safely
 int28 proc
         pushf
         call [cs:old28]
-        cmp [cs:in13], 0
-        jne .x
-        pushf
-        cli
         call do_poll
-        popf
-.x:     iret
+        iret
 int28 endp
-
+endif
+if PROTI13
 ; BIOS disk calls must not be interrupted by a mode switch: count them
 int13 proc
         inc [cs:in13]
@@ -823,11 +850,12 @@ int13 proc
         dec [cs:in13]
         iret
 int13 endp
-
+endif
 ; CF clear when the interrupted code may be suspended for a poll: DOS is not inside
 ; a function (InDOS, critical error) and no BIOS disk call is in progress. DOS calls
 ; HIMEM and the BIOS from inside its functions; a mode switch in the middle of those
 ; (A20 handling, block moves, BIOS 32-bit transitions) is not safe.
+if DEFERRED or TPMODE
 dos_safe proc
         cmp [cs:in13], 0
         jne .no
@@ -843,22 +871,24 @@ dos_safe proc
 .no:    stc
         ret
 dos_safe endp
+endif
 
-; poll the core on the private stack; interrupts disabled
+if POLLV86
+; poll the core;
+; all registers must be preserved.
+; called by 1) int08, 2) int28
 do_poll proc
-        cmp [cs:dos_usb], 0
-        je .x
-if WINAWARE
+ if WINAWARE
         cmp [cs:handover], 0
         jne .x
-endif
-        cmp [cs:busy], 0
-        jne .x
-if WINAWARE
-        test word ptr [cs:cb.flags], CBF_VXD
+        test byte ptr [cs:cb.flags], CBF_VXD
         jnz .x
-endif
-if ?STKIRQ        
+ endif
+        cmp [cs:in13], 0
+        jne .x
+;        cmp [cs:is_busy], 0
+;        jne .x
+ if ?STKIRQ        
         cmp [cs:irq_onstk], 0
         jne .x
         mov [cs:irq_onstk], 1
@@ -867,91 +897,97 @@ if ?STKIRQ
         push cs
         pop ss
         mov sp, offset irq_stack_top
-endif        
-        pushad
-;        push ds
-;        push es
-        ; interrupts that arrived at an unsafe moment first
-        mov cx, [cs:irq_deferred]
-        test cx, cx
-        jz .poll
-        mov [cs:irq_deferred], 0
+ else
+        sti
+ endif        
+        push eax
+        push ebx
+        push ecx
+ if DEFERRED
+;--- interrupts that arrived at an unsafe moment first;
+;--- irq_deferred is modified by USB controller irqs ( hence never if /POLL is set )
+        xor cx, cx
+        xchg cx, [cs:irq_deferred]
+        jcxz .poll
         xor ebx, ebx
 .dirq:  shr cx, 1
         jnc .dnext
-;        push cx
-;        push ebx
         mov ax, FN_IRQ
         call callcore
-;        pop ebx
-;        pop cx
         call irq_unmask
 .dnext: inc bx
         test cx, cx
         jnz .dirq
-.poll:  mov ax, FN_POLL
+.poll:
+ endif        
+        mov ax, FN_POLL
         xor ebx, ebx
         call callcore
-        call kq_drain
-;        pop es
-;        pop ds
-        popad
-if ?STKIRQ
+;--- kq_drain called here or in the core (platjlm.c, ent_poll())
+;       call [cs:pkq_drain]	;inside do_poll proc
+        pop ecx
+        pop ebx
+        pop eax
+ if ?STKIRQ
         lss sp, dword ptr [cs:irq_sp]
         mov [cs:irq_onstk], 0
-endif        
-ifdef PKG_USB
+ endif        
+ ifdef PKG_USB
         call aux_deliver
-endif
+ endif
 .x:     ret
 do_poll endp
+endif
 
+if DEFERRED
 ; BL = IRQ: unmask it in the PIC
 irq_unmask proc
         push ax
         push cx
-        mov cl, bl
-        mov ah, 1
+        movzx cx, bl
         cmp cl, 8
         jae .hi
-        shl ah, cl
-        not ah
         in al, 21h
-        and al, ah
+        btr ax, cx
         out 21h, al
         jmp .x
-.hi:    sub cl, 8
-        shl ah, cl
-        not ah
+.hi:    sub cx, 8
         in al, 0A1h
-        and al, ah
+        btr ax, cx
         out 0A1h, al
 .x:     pop cx
         pop ax
         ret
 irq_unmask endp
+endif
 
+if PROCESSKQ
 ; keyboard / aux interrupts: after the owner read port 60h, push the next queued byte
 int09 proc
         pushf
         call [cs:old09]
-        call kq_drain
+        call [cs:pkq_drain]	;int09 proc (PROCESSKQ)
         iret
 int09 endp
+endif
 
 ifdef PKG_USB
+
+ if TPMODE or PROCESSKQ
+
 ; IRQ 12: while JAIUSB drives a PS/2 touchpad its bytes are queued for the core (decoded at
 ; once when the moment is safe, else at the next poll); the BIOS gets them during its own
 ; pointing device calls
 int74 proc
-        test [cs:cbx.mode], 1
+  if TPMODE
+        test [cs:cbx.mode], 1   ;touchpad mode? let BIOS handle IRQ12?
         jz .bios
-        cmp [cs:cbx.bios], 0
+        cmp [cs:cbx.bios], 0    ;inside int 15h, ah=C2h?
         jne .bios
         push ax
         in al, 64h
         and al, 21h
-        cmp al, 21h
+        cmp al, 21h    ; mouse data available?
         jne .notaux
         in al, 60h
         push bx
@@ -959,7 +995,7 @@ int74 proc
         mov bl, [cs:cbx.qhead]
         mov [cs:cbx.q+bx], al
         inc bl
-        and bl, 63
+        and bl, WIN_AUXQ - 1
         cmp bl, [cs:cbx.qtail]
         je .full
         mov [cs:cbx.qhead], bl
@@ -972,104 +1008,118 @@ int74 proc
         iret
 .notaux:
         pop ax
-.bios:  pushf
+.bios:
+  endif
+        pushf
         call [cs:old74]
-        call kq_drain
+  if PROCESSKQ
+        call [cs:pkq_drain]	;int74 proc (PROCESSKQ, USB)
+  endif
         iret
 int74 endp
 
+ endif ; TPMODE or PROCESSKQ
+
+ if TPMODE
 ; the core decodes the queued aux bytes now if DOS may be interrupted, then the packets go
 ; to the DOS mouse driver; all registers kept
 aux_core proc
-if WINAWARE
+  if WINAWARE
         cmp [cs:handover], 0
         jne .x
-endif
-        cmp [cs:busy], 0
-        jne .x
-if ?STKIRQ
-        cmp [cs:irq_onstk], 0
-        jne .x
-endif
+  endif
+;        cmp [cs:is_busy], 0
+;        jne .x
         call dos_safe
         jc .x
-if ?STKIRQ        
+  if ?STKIRQ        
+        cmp [cs:irq_onstk], 0
+        jne .x
         mov [cs:irq_onstk], 1
         mov [cs:irq_sp], sp
         mov [cs:irq_ss], ss
         push cs
         pop ss
         mov sp, offset irq_stack_top
-endif
+  endif
         push eax
         push ebx
-;        pushad
-;        push ds
-;        push es
         mov ax, FN_IRQ
         mov ebx, 12
         call callcore
-;        pop es
-;        pop ds
-;        popad
         pop ebx
         pop eax
-if ?STKIRQ        
+  if ?STKIRQ        
         lss sp, dword ptr [cs:irq_sp]
         mov [cs:irq_onstk], 0
-endif        
+  endif        
 .x:     call aux_deliver
         ret
 aux_core endp
 
+ endif
+
+if TPMODE or POLLV86
 ; packets of the core to the pointing device BIOS callback, as the BIOS's IRQ 12 handler
 ; would call it: status, X, Y, Z pushed as words, far call
 ; no register modified
 aux_deliver proc
         cmp [cs:auxdeliv], 0
         jne .r
-        mov [cs:auxdeliv], 1
-        pushad
         push ds
-        push es
-.l:     xor bh, bh
-        mov bl, [cs:cbx.ptail]
-        cmp bl, [cs:cbx.phead]
-        je .done
-        inc [cs:cbx.ptail]
-        and [cs:cbx.ptail], 15
-        test word ptr [cs:cb.flags], CBF_AUXBIOS
-        jz .l
-        cmp word ptr [cs:cbx.cbfn+2], 0
-        je .l
-        shl bx, 2
-        xor ah, ah
-        mov al, [cs:cbx.pk+bx]
-        push ax
-        mov al, [cs:cbx.pk+bx+1]
-        push ax
-        mov al, [cs:cbx.pk+bx+2]
-        push ax
-        mov al, [cs:cbx.pk+bx+3]
-        push ax
-        call [cs:cbx.cbfn]
-        add sp, 8
-        jmp .l
-.done:  pop es
+        push cs
         pop ds
-        popad
-        mov [cs:auxdeliv], 0
+        mov [auxdeliv], 1
+        push ebx
+.l:     mov bh, 0
+        mov bl, [cbx.ptail]
+        cmp bl, [cbx.phead]
+        je .done
+        shl bx, 2
+        mov ebx, dword ptr [cbx.pk+bx]
+        inc [cbx.ptail]
+        and [cbx.ptail], 15
+        test word ptr [cb.flags], CBF_AUXBIOS
+        jz .l
+        cmp word ptr [cbx.cbfn+2], 0
+        je .l
+        pusha
+        mov ah, 0
+        mov al, bl
+        push ax
+        mov al, bh
+        push ax
+        shr ebx,16
+        mov al, bl
+        push ax
+        mov al, bh
+        push ax
+        call [cbx.cbfn]
+        add sp, 8
+        popa
+        jmp .l
+.done:
+        mov [auxdeliv], 0
+        pop ebx
+        pop ds
 .r:     ret
 aux_deliver endp
-else
+endif
+
+else ;PKG_USB
+
 int74 proc
         pushf
         call far [cs:old74]
-        call kq_drain
+  if PROCESSKQ
+        call [cs:pkq_drain]	;int74 proc (PROCESSKQ, Non-USB)
+  endif
         iret
 int74 endp
+
 endif
 
+if IRQX
 ; USB host controller IRQs
 IRQNO = 0
 irqs0:
@@ -1088,17 +1138,18 @@ irq_common proc
         mov bp,sp
         push bx
         push ax
-        mov bx,[bp+2*2]
+        mov bx,[bp+2*2]      ;get IRQ#
 if WINAWARE
         cmp [cs:handover], 0
         jne .chain
 endif        
-        cmp [cs:busy], 0
-        jne .chain
+;        cmp [cs:is_busy], 0
+;        jne .chain
 if ?STKIRQ        
         cmp [cs:irq_onstk], 0
         jne .chain
 endif        
+if DEFERRED
         call dos_safe
         jnc .now
         ; A line shared with another device is never masked: its driver (e.g. the BIOS disk
@@ -1134,6 +1185,7 @@ endif
         add sp,2+2
         iret
 .now:
+endif
 if ?STKIRQ
         mov [cs:irq_onstk], 1
         mov [cs:irq_sp], sp
@@ -1144,17 +1196,13 @@ if ?STKIRQ
 endif        
         push eax
         push ebx
-;        pushad
-;        push ds
-;        push es
         movzx ebx, bx
         mov ax, FN_IRQ
         call callcore
         mov [cs:irqchain], eax
-        call kq_drain
-;        pop es
-;        pop ds
-;        popad
+if PROCESSKQ
+        call [cs:pkq_drain]	;inside USB host controller IRQ proc
+endif        
         pop ebx
         pop eax
 if ?STKIRQ        
@@ -1188,7 +1236,9 @@ endif
 		pop bp
 		retf
 irq_common endp
+endif
 
+if DEFERRED
 ; AL = IRQ: set INTx disable in the PCI command register of our controllers on that line
 intx_off proc
         push eax
@@ -1226,6 +1276,7 @@ intx_off proc
         pop eax
         ret
 intx_off endp
+endif
 
 ifdef PKG_DISK
 ; ---------------------------------------------------------------------------
@@ -1388,80 +1439,111 @@ vds_filter endp
 
 endif ;PKG_DISK
 
-	@idata
-
 ; ===========================================================================
 ; initialization (discarded after INIT)
 ; ===========================================================================
-init_ok         db 0
-	align 4
-cmdline         dd 0
-coresize        dd 0
-imgtotal        dd 0
-filesize        dd 0
+
+	@idata
+
+; core_init parameters
+params label core_params
+p_pool_lin      dd 0
+p_pool_phys     dd 0
+p_pool_size     dd 0
+p_cb_lin        dd 0
+p_mode          dd 1	;1=DOS (PM_DOS), 2=VxD (PM_VXD)
+p_flags         dd 0
+p_mbr_lin       dd 0
+                dd 0, 0
+
+drv_lin         dd 0	;linear address of driver header
+ifdef PKG_AUDIO
 fhandle         dw 0
-emb_off         dd 0            ; offset of the 4K-aligned window start inside the EMB
-	align 4
-;pathbuf         db 96 dup (0)
-
-if 0
-XMSBLK struct
-len      dd ?
-hSrc     dw ?
-ofsSrc   dd ?
-hDst     dw ?
-ofsDst   dd ?
-XMSBLK ends
-
-xmove XMSBLK <>
 endif
 
-msg_banner      db BANNER, 13, 10, '$'
-msg_no386       db DRVNAME, ': 386 or later required', 13, 10, '$'
-msg_notsc       db DRVNAME, ': CPU without time stamp counter (Pentium or later required)', 13, 10, '$'
-msg_noxms       db DRVNAME, ': XMS driver (HIMEM.SYS) not loaded', 13, 10, '$'
-msg_noemb       db DRVNAME, ': cannot allocate extended memory', 13, 10, '$'
-msg_nojlm       db DRVNAME, ': ', COREFILE, ' not responding', 13, 10, '$'
-msg_units1      db DRVNAME, ': drives $'
-msg_units2      db ':$'
-msg_nounits     db DRVNAME, ': no drive letters assigned', 13, 10, '$'
+HOOKS struct
+intno	db ?
+ofs		dw ?
+HOOKS ends
+
+hooks label HOOKS
+ifdef PKG_USB
+ if POLLV86
+    HOOKS < 8h, offset int08>
+    HOOKS <28h, offset int28>
+ endif
+ if PROCESSKQ
+    HOOKS < 9h, offset int09>
+ endif
+ if TPMODE or PROCESSKQ
+    HOOKS <74h, offset int74>
+ endif
+    HOOKS <15h, offset int15>
+ if PROTI13
+    HOOKS <13h, offset int13>
+ endif
+    HOOKS <2Fh, offset int2f>
+else
+    HOOKS < 8h, offset int08>
+    HOOKS <28h, offset int28>
+    HOOKS <13h, offset int13>
+ ifdef PKG_DISK
+    HOOKS <13h, offset int13d>
+ endif
+    HOOKS <2Fh, offset int2f>
+endif
+end_hooks equ $
+
+msg_banner      db BANNER
 msg_crlf        db 13, 10, '$'
-msg_nodisk      db DRVNAME, ': no disk found, not installed (/S shows the full probe log)', 13, 10, '$'
-msg_chrdev      db DRVNAME, ': no drive letters; resident for Windows', 13, 10, '$'
+msg_drvname     db DRVNAME, ': $'
+msg_no386       db '386 or later required', 13, 10, '$'
+msg_notsc       db 'CPU without time stamp counter (Pentium or later required)', 13, 10, '$'
+msg_noxms       db 'XMS driver (HIMEM.SYS) not loaded', 13, 10, '$'
+msg_noemb       db 'cannot allocate extended memory', 13, 10, '$'
+msg_nojlm       db COREFILE, ' not responding', 13, 10, '$'
+msg_units1      db 'drives $'
+msg_units2      db ':$'
+msg_nounits     db 'no drive letters assigned', 13, 10, '$'
+ifdef PKG_DISK
+msg_nodisk      db 'no disk found, not installed (/S shows the full probe log)', 13, 10, '$'
+msg_chrdev      db 'no drive letters; resident for Windows', 13, 10, '$'
+endif
 ifdef PKG_DISK
 chrname         db 'WINDISK$'
 endif
-msg_usb         db DRVNAME, ': ', DOSACTIVE, 13, 10, '$'
+msg_usb         db DOSACTIVE, 13, 10, '$'
 ifdef PKG_AUDIO
-msg_nosnd       db DRVNAME, ': no sound hardware found, not installed (/S shows the probe log)', 13, 10, '$'
+msg_nosnd       db 'no sound hardware found, not installed (/S shows the probe log)', 13, 10, '$'
 endif
-;corename        db COREFILE, 0
 if WINAWARE
 vxdname         db VXDFILE, 0
 endif
 
-	.code _ITEXT
+    .code _ITEXT
+
+printdn proc
+        push dx
+        mov dx, offset msg_drvname
+        call print
+        pop dx
+printdn endp   ;fall thru
 
 print proc
-;        push ax
-;        push ds
-;        push cs
-;        pop ds
         mov ah, 09h
         int 21h
-;        pop ds
-;        pop ax
         ret
 print endp
 
 ;--- expects stack frame from interrupt proc, that is
-;--- [sp]    -> 8 GPRs (pushad)
-;--- [sp+32] -> ES
-;--- [sp+34] -> DS
-;--- [sp+36] -> caller (near)
-;--- ES:BX -> RP
+;--- [sp]   -> BX, ES
+;--- [sp+4] -> caller (near)
+;--- ES:BX  -> RP
 
 do_init proc
+        cld
+        push ds
+        pushad
         push cs
         pop ds
         mov [cb.drvseg], cs
@@ -1469,29 +1551,24 @@ do_init proc
         call print
         ; CB defaults
         mov [cb.magic], 42433357h
-        mov [cb.version], 0100h
-;        mov [cb.size_], 2048
+        mov [cb.version], 0101h
+        mov byte ptr [cb.flags], CBF_BUSY
         mov [cb.size_], sizeof wincb
-;        mov al, [mplex]
         mov byte ptr [cb.mplex], WIN_MPLEX
         mov [cb.slotreq], DEFSLOTS or 80h  ; default: grows with the partitions found
-;        les bx, [reqptr]
         mov al, [es:bx].RP.RPDN
         mov [cb.firstdrive], al
-        mov eax, [es:bx].RP.RPCL
-        mov [cmdline], eax
+        les si, [es:bx].RP.RPCL
         mov ah, 30h
-        int 21h
+        int 21h                ;modifies BX
         xchg al, ah
         mov [cb.dosver], ax
         mov ax, cs
         movzx eax, ax
         shl eax, 4
         mov [drv_lin], eax
-
         add eax, offset cb
         mov [cb.cb_lin], eax
-
         call parse_cmdline
 if 0;def PKG_USB
         ; MS-DOS 7 (Windows 95/98): the Plug and Play VxD and its port driver give the disks
@@ -1503,6 +1580,12 @@ if 0;def PKG_USB
         or [cb.opts2], OPT2_NODISK
         mov [cb.slotreq], 0
 .dosdisk:
+endif
+if PROCESSKQ
+        test [cb.opts], OPT_NOKBC
+        jz .nokbc
+        mov [pkq_drain], offset _ret
+.nokbc:
 endif
 ifndef PKG_DISK
         or word ptr [cb.opts], OPT_USB   ; core in DOS and standard mode unless /WIN
@@ -1528,8 +1611,8 @@ endif
         test ax, 7000h
         jnz .is386
         mov dx, offset msg_no386
-        call print
-        jmp init_fail
+        call printdn
+        jmp .init_fail
 .is386:
         ; CPUID / TSC
         pushfd
@@ -1552,8 +1635,8 @@ endif
         test dl, 10h
         jnz .tscok
 .notsc: mov dx, offset msg_notsc
-        call print
-        jmp init_fail
+        call printdn
+        jmp .init_fail
 .tscok:
         ; XMS
         mov ax, 4300h
@@ -1561,8 +1644,8 @@ endif
         cmp al, 80h
         je .xms
         mov dx, offset msg_noxms
-        call print
-        jmp init_fail
+        call printdn
+        jmp .init_fail
 .xms:   mov ax, 4310h
         int 2Fh
         mov word ptr [xmsentry+0], bx
@@ -1571,11 +1654,10 @@ endif
         pop es
 
         call load_core
-        jc init_fail
+        jc .init_fail
         call read_bios_mbrs
         call read_bds
-        mov [core_ok], 1
-        or word ptr [cb.flags], CBF_DOSCORE
+        mov byte ptr [cb.flags], CBF_DOSCORE
 
         ; core_init(params)
         mov ax, FN_INIT
@@ -1615,7 +1697,7 @@ ifndef PKG_USB
         rep movsb
         or word ptr [cb.flags], CBF_CHARDEV
         mov dx, offset msg_chrdev
-        call print
+        call printdn
         jmp .serve
  else
         ; sound devices found: resident as the character device WINAUD$
@@ -1628,7 +1710,7 @@ ifndef PKG_USB
         mov ax, FN_SHUTDOWN
         xor ebx, ebx
         call callcore
-        mov [core_ok], 0
+        or byte ptr [cb.flags], CBF_BUSY
  ifdef PKG_AUDIO
         call free_fw
  endif
@@ -1637,15 +1719,16 @@ ifndef PKG_USB
  else
         mov dx, offset msg_nosnd
  endif
-        call print
-        jmp init_fail
+        call printdn
+        jmp .init_fail
 .serve:
 endif
-        ; DOS-mode USB hooks
-        test word ptr [cb.opts], OPT_USB
-        jz .nousb
-        mov [dos_usb], 1
-        or word ptr [cb.flags], CBF_USB
+        ; DOS-mode? (always true) 
+;        test word ptr [cb.opts], OPT_USB
+;        jz .nousb
+;        mov [dos_usb], 1
+        or byte ptr [cb.flags], CBF_USB
+if DEFERRED or TPMODE
         push es
         push bx
         mov ah, 34h                     ; InDOS flag address
@@ -1654,26 +1737,29 @@ endif
         mov word ptr [indos_ptr+2], es
         pop bx
         pop es
+endif
+if IRQX
         call hook_irqs                  ; before INT 08h can poll (INTx goes on at the first poll)
+endif
         mov dx, offset msg_usb
-        call print
-        mov al, 08h
-        mov di, offset old08
-        mov dx, offset int08
+        call printdn
+        mov si, offset hooks
+        mov di, offset oldvecs
+.nexthook:
+        lodsb
+        mov cl, al
+        lodsw
+        cmp cl, -1
+        jz @F
+        mov dx, ax
+        mov al, cl
         call hook
+@@:
+        add di, 4
+        cmp si, offset end_hooks
+        jnz .nexthook
+
 ifdef PKG_USB
-        mov al, 09h
-        mov di, offset old09
-        mov dx, offset int09
-        call hook
-        mov al, 74h
-        mov di, offset old74
-        mov dx, offset int74
-        call hook
-        mov al, 15h
-        mov di, offset old15
-        mov dx, offset int15
-        call hook
  if WINAWARE
         ; INT 33h (DOS mouse API): provide the USB mouse to INT 33h clients (DOS programs and
         ; the Microsoft Mouse driver of Windows 1.0x / 2.x). A real DOS mouse driver loaded
@@ -1685,25 +1771,7 @@ ifdef PKG_USB
         mov [m33_on], 1
  endif
 endif
-        mov al, 13h
-        mov di, offset old13
-        mov dx, offset int13
-        call hook
-        mov al, 28h
-        mov di, offset old28
-        mov dx, offset int28
-        call hook
-.nousb:
-ifdef PKG_DISK
-        mov al, 13h
-        mov di, offset old13d
-        mov dx, offset int13d
-        call hook
-endif
-        mov al, 2Fh
-        mov di, offset old2f
-        mov dx, offset int2f
-        call hook
+;.nousb:
 if WINAWARE
         ; SIS for Windows enhanced mode
         mov word ptr [sis_path+0], offset cb.vxdpath
@@ -1715,10 +1783,7 @@ endif
         jz .block
         les bx, [reqptr]
         mov [es:bx].RP.RPUnit, 0
-        mov [es:bx].RP.RPLen, offset resident_end
-        mov [es:bx].RP.RPSeg, cs
-        mov [es:bx].RP.RPStat, 0100h
-        jmp init_ret
+        jmp .init_ok
 .block:
         ; at least one unit, otherwise DOS discards the driver
         cmp [cb.nunits], 0
@@ -1726,56 +1791,40 @@ endif
         mov [cb.nunits], 1
         mov [cb.units.type_], 2       ; UT_SLOT
         mov dx, offset msg_nounits
-        call print
+        call printdn
 .haveunits:
         ; BPB pointer array
         movzx cx, [cb.nunits]
-        xor si, si
+        mov di, offset cb.bpbptr
         mov ax, offset cb.units + winunit.bpb
-.bpb:   mov [cb.bpbptr+si], ax
+.bpb:   stosw
         add ax, sizeof winunit
-        add si, 2
         loop .bpb
         call show_units
         les bx, [reqptr]
         mov al, [cb.nunits]
         mov [es:bx].RP.RPUnit, al
         mov [hdr_units], al
-        mov [es:bx].RP.RPLen, offset resident_end
-        mov [es:bx].RP.RPSeg, cs
         mov word ptr [es:bx].RP.RPCL+0, offset cb.bpbptr
         mov word ptr [es:bx].RP.RPCL+2, cs
+.init_ok:
+        mov [es:bx].RP.RPLen, offset resident_end
+        mov [es:bx].RP.RPSeg, cs
         mov [es:bx].RP.RPStat, 0100h
-        jmp init_ret
-
-init_fail:
+        jmp .init_ret
+.init_fail:
         les bx, [reqptr]
         mov [es:bx].RP.RPUnit, 0
         mov [es:bx].RP.RPLen, 0
         mov [es:bx].RP.RPSeg, cs
         mov [es:bx].RP.RPStat, 810Ch
-init_ret:
+.init_ret:
         popad
-        pop es
         pop ds
+        pop bx
+        pop es
         ret
 do_init endp
-
-	@idata
-
-	align 4
-; core_init parameters
-params label core_params
-p_pool_lin      dd 0
-p_pool_phys     dd 0
-p_pool_size     dd 0
-p_cb_lin        dd 0
-p_mode          dd 1
-p_flags         dd 0
-p_mbr_lin       dd 0
-                dd 0, 0
-
-	.code _ITEXT
 
 ; AL = vector, DI = old vector slot, DX = new handler
 hook proc
@@ -1796,7 +1845,9 @@ hook proc
         ret
 hook endp
 
+if IRQX
 ;--- hook irqs 0-15 depending on irqmask
+;--- modifies ax, cx, dx, di
 
 hook_irqs proc
         mov cx, 0
@@ -1842,26 +1893,24 @@ hook_irqs proc
         ret
 hook_irqs endp
 
-; ---------------------------------------------------------------------------
-parse_cmdline proc uses es
+endif
 
-        les si, [cmdline]
-        ; copy the driver path to pathbuf
-        xor di, di
-.p:     mov al, [es:si]
+; ---------------------------------------------------------------------------
+; es:si -> cmdline
+
+parse_cmdline proc
+
+        ; skip the driver path
+.p:     lodsb es:[si]
         cmp al, ' '
         jbe .pe
         cmp al, '/'
         je .pe
-;        mov [pathbuf+di], al
-        inc si
-        inc di
-        cmp di, 80
-        jb .p
+        jmp .p
 .pe:
-;       mov [pathbuf+di], 0
-        ; options
-.o:     mov al, [es:si]
+        dec si
+;--- options
+.o:     lodsb es:[si]
         cmp al, 13
         je .done
         cmp al, 10
@@ -1872,10 +1921,10 @@ parse_cmdline proc uses es
         je .opt
         cmp al, '-'
         je .opt
-        inc si
         jmp .o
-.opt:   inc si
-        ; token -> tok (upper case)
+
+;--- token -> tok (upper case)
+.opt:   
         xor di, di
 .tk:    mov al, [es:si]
         cmp al, ' '
@@ -1887,41 +1936,43 @@ parse_cmdline proc uses es
         cmp al, 'z'
         ja .tu
         sub al, 20h
-.tu:    cmp di, 15
+.tu:    cmp di, 15   ;sizeof tok - 1
         jae .tn
         mov [tok+di], al
         inc di
 .tn:    inc si
         jmp .tk
 .te:    mov [tok+di], 0
+
         cmp word ptr [tok], ':R'
         jne .tab
-        mov al, [tok+2]
+        mov ax, word ptr [tok+2]
         sub al, '0'
         cmp al, 9
         ja .o
-        mov ah, [tok+3]
         sub ah, '0'
         cmp ah, 9
         ja .one
-        mov bl, 10
-        mul bl
-        add al, [tok+3]
-        sub al, '0'
-.one:   cmp al, 20
+        shl al, 1   ;*2
+        mov bl, al
+        shl al, 2   ;*8
+        add al, bl  ;*10
+        add al, ah
+.one:   cmp al, WIN_MAXUNITS
         jbe .st
-        mov al, 20
+        mov al, WIN_MAXUNITS
 .st:    mov [cb.slotreq], al
         jmp .o
+
 .tab:   mov bx, offset optab
-        mov [opt2pass], 0
-.t:     mov edx, [bx]
+        mov cx, offset cb.opts
+.t:     mov edx, [bx]              ;<---
         test edx, edx
         jnz .t1
-        cmp [opt2pass], 0
+        cmp cx, offset cb.opts
         jne .o
-        mov [opt2pass], 1          ; second option word (OPT2_*)
         mov bx, offset optab2
+        mov cx, offset cb.opts2
         jmp .t
 .t1:    push si
         lea si, [bx+4]
@@ -1935,45 +1986,17 @@ parse_cmdline proc uses es
         inc di
         jmp .cmp
 .eq:    pop si
-        cmp [opt2pass], 0
-        jne .eq2
-        or [cb.opts], edx
-        jmp .o
-.eq2:   or [cb.opts2], dx
+        mov bx, cx
+        or [bx], edx
         jmp .o
 .ne:    pop si
         add bx, 4
-.sk:    cmp byte ptr [bx], 0
-        je .sk2
-        inc bx
-        jmp .sk
-.sk2:   inc bx
+.sk:    mov al, [bx]
+        inc bx 
+        cmp al, 0
+        jne .sk
         jmp .t
 .done:
-if 0
-        ; directory part of the path
-        mov di, 0
-        mov bx, 0
-.d:     mov al, [pathbuf+di]
-        test al, al
-        jz .de
-        cmp al, '\'
-        jne .dn
-        lea bx, [di+1]
-.dn:    inc di
-        jmp .d
-.de:    ; core path in pathbuf, vxd path in CB
-        push cs
-        pop es
-        mov si, offset corename
-        lea di, [pathbuf+bx]
-        push bx
-.c1:    lodsb
-        stosb
-        test al, al
-        jnz .c1
-        pop bx
-endif
 if WINAWARE
         mov cx, bx
         mov si, offset pathbuf
@@ -1988,11 +2011,7 @@ endif
         ret
 parse_cmdline endp
 
-
 	@idata
-
-tok     db 16 dup (0)
-opt2pass db 0
 
 ; option bit, name (second table: bits of the second option word)
 
@@ -2006,14 +2025,16 @@ ifdef PKG_USB
         db 'NOTBUSB', 0
         dd OPT2_PCIHP
         db 'PCIHP', 0
-;        dd OPT2_DOSDISK
+;        dd OPT2_DOSDISK	;obsolete
 ;        db 'DOSDISK', 0
-        dd OPT2_NOPS2
-        db 'NOPS2', 0
+;        dd OPT2_NOPS2		;windows-only option
+;        db 'NOPS2', 0
         dd OPT2_NOTP
         db 'NOTP', 0
         dd OPT2_NOSMB
         db 'NOSMB', 0
+        dd OPT2_NOPOLL		;JAIUSB: added to force IRQ mode
+        db 'NOPOLL', 0
 endif
 ifdef PKG_AUDIO
         dd OPT2_DSP
@@ -2110,26 +2131,6 @@ endif
 	.code _ITEXT
 
 ; ---------------------------------------------------------------------------
-if 0
-; XMS move of ecx bytes from conventional ESI(seg:off) to EMB offset EDI
-xms_to_emb proc
-        mov [xmove.len], ecx
-        mov [xmove.hSrc], 0
-        mov [xmove.ofsSrc], esi
-        mov ax, [emb_handle]
-        mov [xmove.hDst], ax
-        mov [xmove.ofsDst], edi
-        mov si, offset xmove
-        mov ah, 0Bh
-        call [xmsentry]
-        cmp ax, 1
-        jne .e
-        clc
-        ret
-.e:     stc
-        ret
-xms_to_emb endp
-endif
 
 ; clear the init buffer (BX = bytes)
 clrbuf:
@@ -2381,11 +2382,11 @@ load_core proc
         ret
 .nojlm:
         mov dx, offset msg_nojlm
-        call print
+        call printdn
         stc
         ret
 .noemb: mov dx, offset msg_noemb
-        call print
+        call printdn
         stc
         ret
 load_core endp
@@ -2506,7 +2507,7 @@ read_bds endp
 
 show_units proc
         mov dx, offset msg_units1
-        call print
+        call printdn
         movzx cx, [cb.nunits]
         mov bl, [cb.firstdrive]
         add bl, 'A'
@@ -2526,11 +2527,11 @@ show_units proc
 show_units endp
 
 ifdef ?MZ
-	.stack 256
-	.dosseg
 startlbl textequ <_start>
+    .stack 128
+    .dosseg
 _start:
-	push cs
+    push cs
     pop ds
     mov dx,offset startmsg
     mov ah,9
@@ -2541,13 +2542,14 @@ startmsg db "JAIUSB.SYS must be launched by a DEVICE= line in CONFIG.SYS",13,10,
 _BSS segment para public 'BSS'
 _BSS ends
 	.data?
+tok     db 16 dup (?)
 mbrbuf  db 8 * 512 dup (?)
 initbuf db 4096 dup (?)
 else
-        align 16
-mbrbuf  db 8 * 512 dup (0)
-        align 16
 startlbl textequ <>
+        align 16
+tok     db 16 dup (0)
+mbrbuf  db 8 * 512 dup (0)
 initbuf label byte
 endif
 

@@ -4,8 +4,10 @@ set WATCOM=\ow20
 rem HXRT installed to run OW's Win32 binaries
 set PATH=%WATCOM%\binnt;%PATH%
 set INCLUDE=%WATCOM%\h
-set CDEF=-q -mf -s -zl -ox -wx -we -zp4 -ei -DWIN_USB -DPKG_USB -D_DEBUG -Isrc\core -Isrc\inc -fobjlm\
-set NASMDIR=\tools
+rem set directory where jwasm is to find jlm.inc
+set JEMMINC=\projects\jemm\include
+rem set CDEF=-q -mf -s -zl -ox -wx -we -zp4 -ei -DWIN_USB -DPKG_USB -D_DEBUG -Isrc\core -Isrc\inc -fobjlm\
+set CDEF=-q -mf -s -zl -ox -wx -we -zp4 -ei -DWIN_USB -DPKG_USB -Isrc\core -Isrc\inc -fobjlm\
 
 wcc386 -bt=windows %CDEF% src\core\winlib.c
 wcc386 -bt=windows %CDEF% src\core\pci.c
@@ -42,9 +44,9 @@ wcc386 -bt=windows %CDEF% src\core\cdrom.c
 wcc386 -bt=windows %CDEF% -I\projects\jemm\include src\jlm\platjlm.c
 
 wlib -n -b -q bjlm\core.lib @corejlm.lbc
-jwasm -q -I\projects\jemm\include -Fobjlm/jlment.obj src/jlm/jlment.asm
+jwasm -q -I%JEMMINC% -Fobjlm/jlment.obj src/jlm/jlment.asm
 jwlink name bjlm/JAIUCORE.DLL @corejlm.lnk
 
 tools\h2incx.exe -b -y -o src/jlm src/inc/winapi.h
-jwasm -q -mz -D?MZ -Flbjlm/JAIUSB.lst -D?KD -DPKG_USB -Fobjlm/JAIUSB.SYS src/jlm/winstor.asm
+jwasm -q -mz -D?MZ -Flbjlm/JAIUSB.lst -DPKG_USB -Fobjlm/JAIUSB.SYS src/jlm/winstor.asm
 

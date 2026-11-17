@@ -1,5 +1,5 @@
 ;--- include file created by h2incx v1.0 (Public Domain, written by Andreas Grech)
-;--- source file: C:\PROJECTS\JAIUSB\SRC\INC\winapi.h, last modified: 10/25/2026 21:4
+;--- source file: C:\PROJECTS\JAIUSB\SRC\INC\winapi.h, last modified: 11/16/2026 19:31
 ;--- cmdline used for creation:  -b -y -o src/jlm src/inc/winapi.h
 
 ifndef WINAPI_H
@@ -37,6 +37,7 @@ else
 WIN_MPLEX	EQU	<WIN_MPLEX_DISK>
 WIN_VXD_ID	EQU	<WIN_VXD_DISK>
 endif 
+WIN_BPBXSIZE	EQU	25 + 28
 UT_NONE	EQU	0
 UT_FIXED	EQU	1
 UT_SLOT	EQU	2
@@ -44,6 +45,23 @@ US_PRESENT	EQU	01h
 US_CHANGED	EQU	02h
 US_WPROT	EQU	04h
 US_EJECTED	EQU	08h
+US_FOREIGN	EQU	10h
+US_TAKEN	EQU	20h
+bpb_s	struct 
+bps	WORD	?
+spc	BYTE	?
+ressecs	WORD	?
+nfats	BYTE	?
+rootent	WORD	?
+secsfat12	WORD	?
+media	BYTE	?
+spf	WORD	?
+spt	WORD	?
+trks	WORD	?
+hidden	DWORD	?
+secsfat16	DWORD	?
+bpb_s	ends
+
 extbpb_s	struct 
 sectors_fat	DWORD	?
 extflags	WORD	?
@@ -146,6 +164,7 @@ OPT2_ALL4G	EQU	0800h
 OPT2_NOPS2	EQU	0400h
 OPT2_NOTP	EQU	1000h
 OPT2_NOSMB	EQU	2000h
+OPT2_NOPOLL	EQU	4000h
 winmount	struct 
 biosdrv	BYTE	?
 letter	BYTE	?
@@ -184,7 +203,6 @@ slotreq	BYTE	?
 kbcstat	BYTE	?
 mounted	winmount 16 dup (<>)
 bpbptr	WORD WIN_MAXUNITS dup (?)
-rsvd1	WORD 24-16 dup (?)
 cb_lin	DWORD	?
 ticks	DWORD	?
 pollcnt	DWORD	?
@@ -201,19 +219,19 @@ ideown	WORD 8 dup (?)
 hcbdf	WORD 8 dup (?)
 hcirq	BYTE 8 dup (?)
 tsc_khz	DWORD	?
+if 0
 vxdpath	SBYTE 92 dup (?)
+endif 
 units	winunit WIN_MAXUNITS dup (<>)
-rsvd2	SBYTE 64 dup (?)
 nvmeown	WORD 8 dup (?)
 kq_head	BYTE	?
 kq_tail	BYTE	?
-kq	WORD 20 dup (?)
+kq	WORD WIN_KQLEN dup (?)
 mb_absx	WORD	?
 mb_absy	WORD	?
 opts2	WORD	?
 wincb	ends
 
-WIN_CBSIZE	EQU	2048
 WIN_AUXQ	EQU	64
 WIN_AUXPK	EQU	16
 wincbx	struct 

@@ -33,6 +33,8 @@
 #define WIN_VXD_ID       WIN_VXD_DISK
 #endif
 
+#define WIN_BPBXSIZE    25+28 /* new in WinUSB v1.1 */
+
 /* unit types / state */
 #define UT_NONE     0
 #define UT_FIXED    1
@@ -41,6 +43,23 @@
 #define US_CHANGED  0x02
 #define US_WPROT    0x04
 #define US_EJECTED  0x08
+#define US_FOREIGN  0x10  /* v1.2: a file system DOS cannot mount: a small empty read-only volume */
+#define US_TAKEN    0x20  /* v1.2 */
+
+struct bpb_s {
+    unsigned short bps;
+    unsigned char  spc;
+    unsigned short ressecs;
+    unsigned char  nfats;     /* +5 */
+    unsigned short rootent;   /* +6 */
+    unsigned short secsfat12; /* +8 #sectors FAT12 */
+    unsigned char  media;     /* +10 */
+    unsigned short spf;       /* +11 sectors per fat */
+    unsigned short spt;       /* +13 sectors per track */
+    unsigned short trks;      /* +15 tracks */
+    unsigned int   hidden;    /* +17 start partition */
+    unsigned int   secsfat16; /* +21 #sectors FAT16/32 */
+};
 
 struct extbpb_s {
     unsigned int sectors_fat;
@@ -152,6 +171,7 @@ struct winfw {
 #define OPT2_NOPS2      0x0400  /* /NOPS2    : (WINUSB) leave the PS/2 mouse to Windows / the BIOS in 386 enhanced mode */
 #define OPT2_NOTP       0x1000  /* /NOTP     : (WINUSB) PS/2 touchpads stay in their mouse mode, no SMBus touchpads */
 #define OPT2_NOSMB      0x2000  /* /NOSMB    : (WINUSB) touchpads on PS/2 only, not on SMBus */
+#define OPT2_NOPOLL     0x4000  /* /NOPOLL   : (WINUSB) force using IRQ even if shared */
 
 struct winmount {                /* partition already mounted by DOS through INT 13h */
     unsigned char  biosdrv;
@@ -194,7 +214,7 @@ struct wincb {                   /* 2048 bytes, lives in WINDISK.SYS / WINUSB.SY
     unsigned char  kbcstat;     /* 107 */
     struct winmount mounted[16]; /* 108 .. 236 */
     unsigned short bpbptr[WIN_MAXUNITS]; /* 236 .. 284 near pointers for INIT */
-    unsigned short rsvd1[24-16]; /* japheth: since MAXUNITS is reduced */
+    //unsigned short rsvd1[24-16]; /* japheth: since MAXUNITS is reduced */
     unsigned long  cb_lin;      /* 284 linear address seen by DOS core */
     unsigned long  ticks;       /* 288 */
     unsigned long  pollcnt;     /* 292 */
@@ -212,15 +232,16 @@ struct wincb {                   /* 2048 bytes, lives in WINDISK.SYS / WINUSB.SY
     unsigned short hcbdf[8];    /* 328 USB controllers (bus << 8 | dev << 3 | fn) .. */
     unsigned char  hcirq[8];    /* 344 .. and their IRQs (0xFF none), for the real-mode IRQ code */
     unsigned long  tsc_khz;     /* 352 TSC frequency measured by the DOS core */
+#if 0
     char           vxdpath[92]; /* 356 .. 448 */
-
+#endif
     struct winunit units[WIN_MAXUNITS]; /* 448 .. 1984 old: 24*64=1536, new:16*92=1472, 1536-1472=64 bytes to adjust */
-    signed char rsvd2[64];    /* japheth: added so sizeof(struct wincb) and offsets won't change */
+    //signed char rsvd2[64];    /* japheth: added so sizeof(struct wincb) and offsets won't change */
 
     unsigned short nvmeown[8];  /* 1984 NVMe controllers (bus<<8|devfn)+1 owned by the DOS core */
     unsigned char  kq_head;     /* 2000 8042 injection queue (DOS mode) */
     unsigned char  kq_tail;     /* 2001 */
-    unsigned short kq[20];      /* 2002 low byte data, high byte 8042 command D2h/D3h */
+    unsigned short kq[WIN_KQLEN]; /* 2002 low byte data, high byte 8042 command D2h/D3h */
     unsigned short mb_absx;     /* 2042 tablet position 0..65535 */
     unsigned short mb_absy;     /* 2044 */
     unsigned short opts2;       /* 2046 OPT2_* */
@@ -229,7 +250,7 @@ struct wincb {                   /* 2048 bytes, lives in WINDISK.SYS / WINUSB.SY
 /* follows wincb in WINUSB.SYS (DOS mode with /USB): the bytes of a PS/2 touchpad that the
    core drives in its own protocol, caught on IRQ 12, and the packets the core makes for the
    pointing device BIOS callback of the DOS mouse driver */
-#define WIN_CBSIZE      2048
+//#define WIN_CBSIZE      2048
 #define WIN_AUXQ        64
 #define WIN_AUXPK       16
 struct wincbx {

@@ -2,14 +2,14 @@
 #include "core.h"
 
 #ifdef WIN_USB
-#define CORENAME "WINUSB"
+#define CORENAME "JAIUSB"
 #include "audio.h"
 #include "usb.h"
 #elif defined(WIN_AUDIO)
-#define CORENAME "WINAUDIO"
+#define CORENAME "JAIAUDIO"
 #include "audio.h"
 #else
-#define CORENAME "WINDISK"
+#define CORENAME "JAIDISK"
 #endif
 
 struct wincb *cb;

@@ -111,6 +111,12 @@ extern u32 dbg_level;
 #define DBG(...) do { if (dbg_level) kprintf(__VA_ARGS__); } while (0)
 #define DBG2(...) do { if (dbg_level > 1) kprintf(__VA_ARGS__); } while (0)
 
+#ifdef _DEBUG
+#define dprintf(x) kprintf x
+#else
+#define dprintf(x)
+#endif
+
 /* ---- PCI (pci.c) ---- */
 struct pcidev {
     u8 bus, dev, fn, irq;

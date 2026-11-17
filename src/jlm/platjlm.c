@@ -14,6 +14,8 @@ extern int __cdecl PageCommitPhys( unsigned int, unsigned int, unsigned int, uns
 
 u32 plat_mode = PM_DOS;
 
+extern void __cdecl Yield(); /* JAIUSB */
+
 //#define CORE_WIN    0x80000000UL
 //#define PT_MMIO     ((u32 *)(CORE_WIN + 0x3000))
 //#define MMIO_BASE   0xC0000000UL
@@ -33,8 +35,8 @@ u32 rdtsc_lo(void);
 #pragma aux rdtsc_lo = 0x0F 0x31 value [eax] modify exact [eax edx];
 u64 rdtsc64(void);
 #pragma aux rdtsc64 = 0x0F 0x31 value [edx eax] modify exact [eax edx];
-void reload_cr3(void);
-#pragma aux reload_cr3 = "mov eax,cr3" "mov cr3,eax" modify exact [eax];
+//void reload_cr3(void);
+//#pragma aux reload_cr3 = "mov eax,cr3" "mov cr3,eax" modify exact [eax];
 
 static int scr_on;
 
@@ -81,6 +83,13 @@ static void scr_putc(char c)
     outb((u16)(crtc + 1), (u8)pos);
 }
 
+static void dbg_putc(char c);
+#pragma aux dbg_putc = \
+    "mov ax,0" \
+    "int 41h" \
+    parm [dl] \
+    modify exact [ax dl]
+
 void plat_screen(int on)
 {
     scr_on = on;
@@ -95,7 +104,8 @@ void plat_putc(char c)
         for (i = 0; i < 20000 && !(inb((u16)(com_port + 5)) & 0x20); i++) ;
         outb(com_port, (u8)c);
     } else {
-        outb(0xE9, (u8)c);
+        //outb(0xE9, (u8)c);
+        dbg_putc(c);
     }
 }
 
@@ -114,7 +124,8 @@ u32 plat_ms(void)
 void plat_udelay(u32 us)
 {
     u32 t0 = rdtsc_lo(), want = us * tsc_per_us;
-    while (rdtsc_lo() - t0 < want) cpu_pause();
+    //while (rdtsc_lo() - t0 < want) cpu_pause();
+    while (rdtsc_lo() - t0 < want) Yield(); /* JAIUSB */
 }
 
 /* mappings already made are reused (the core probes the hardware again after Windows) */
@@ -160,15 +171,21 @@ static void kq_put(u8 cmd, u8 data)
     cb->kq_head = (u8)((cb->kq_head + 1) % WIN_KQLEN);
 }
 
+#define SWALLOWMD 1
+
 /* push one queued byte into the controller if its output buffer is free */
-static void kq_drain(void)
+void __cdecl kq_drain(void)
 {
+#if SWALLOWMD
     static u32 aux_since;
+#endif
     u16 e;
     int i;
     u8 st;
     if (cb->kq_head == cb->kq_tail) return;
     st = inb(0x64);
+#if SWALLOWMD
+    /* meaning of bit 5 of port 0x64 usually is "mouse output buffer full" */
     if ((st & 0x21) == 0x21) {
         /* mouse data nobody reads (aux interrupt off) would block the keyboard forever */
         if (!aux_since) aux_since = plat_ms() | 1;
@@ -179,10 +196,12 @@ static void kq_drain(void)
         return;
     }
     aux_since = 0;
+#endif
     if (st & 0x03) return;
     e = cb->kq[cb->kq_tail];
     outb(0x64, (u8)(e >> 8));
-    for (i = 0; i < 10000 && (inb(0x64) & 0x02); i++) ;
+    for (i = 0; i < 10000 && (inb(0x64) & 0x02); i++)
+        ;
     outb(0x60, (u8)e);
     cb->kq_tail = (u8)((cb->kq_tail + 1) % WIN_KQLEN);
 }
@@ -192,8 +211,11 @@ void plat_key(const u8 *sc, int n)
     if (cb->opts & OPT_NOKBC) return;
     while (n--) {
         if (kq_space() <= 0) {
-            kprintf("dos: key queue full\n");
-            return;
+            dprintf(("plat_key: key queue full\n"));
+            if ( *sc & 0x80 ) { /* JAIUSB: don't skip "key up" msgs */
+                cb->kq_head = (cb->kq_head + WIN_KQLEN - 1) % WIN_KQLEN;
+            } else
+                return;
         }
         kq_put(0xD2, *sc++);
     }
@@ -251,8 +273,11 @@ static u32 aux_bios_ms, aux_check_ms, aux_good0, aux_bad0;
 
 static struct wincbx *cbx(void)
 {
-    return (struct wincbx *)((u8 *)cb + WIN_CBSIZE);
+    //return (struct wincbx *)((u8 *)cb + WIN_CBSIZE);
+    return (struct wincbx *)((u8 *)cb + sizeof( struct wincb ));
 }
+
+/* write aux packets - read in winstor, aux_deliver */
 
 static void aux_packets(void)
 {
@@ -677,6 +702,7 @@ u32 __cdecl ent_irq(u32 irq)
     u32 r;
     session();
     cb->irqcnt++;
+    dprintf(("ent_irq, cnt=%u\n", cb->irqcnt ));
     r = (u32)core_irq((int)irq);
     if (r == 1) core_poll();
     session_end();

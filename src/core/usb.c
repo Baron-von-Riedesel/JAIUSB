@@ -208,7 +208,9 @@ void usb_irq_setup(struct usb_hc *hc)
     if (cb->opts & OPT_POLL) why = "/POLL";
     else if (hc->irq == 0 || hc->irq > 15 || hc->irq == 2) why = "no IRQ assigned";
     else if (!irq_level(hc->irq)) why = "ISA (edge triggered) IRQ";
-    else if (irq_shared(hc)) why = "IRQ shared with other devices";
+    /* JAIUSB: NOPOLL ignores shared IRQs */
+    //else if (irq_shared(hc)) why = "IRQ shared with other devices";
+    else if (irq_shared(hc) && !(cb->opts2 & OPT2_NOPOLL)) why = "IRQ shared with other devices";
     else if (plat_irq_attach(hc->irq)) why = "IRQ not available";
     if (why) {
         kprintf("usb: %s IRQ %d: polled (%s)\n", hc->name, hc->irq, why);
