@@ -259,6 +259,12 @@ static void wheel_to_keys(int dz)
     }
 }
 
+int plat_pnp_ours(u32 bdf)
+{
+    (void)bdf;
+    return 1;
+}
+
 #ifdef WIN_USB
 #include "usb.h"
 /* ---- PS/2 touchpad (Synaptics / ELAN, ps2tp.c) in DOS mode ----
@@ -277,7 +283,7 @@ static struct wincbx *cbx(void)
     return (struct wincbx *)((u8 *)cb + sizeof( struct wincb ));
 }
 
-/* write aux packets - read in winstor, aux_deliver */
+/* write aux packets - read in jlmstor, aux_deliver */
 
 static void aux_packets(void)
 {

@@ -1,6 +1,6 @@
 ;--- include file created by h2incx v1.0 (Public Domain, written by Andreas Grech)
-;--- source file: C:\PROJECTS\JAIUSB\SRC\INC\winapi.h, last modified: 11/16/2026 19:31
-;--- cmdline used for creation:  -b -y -o src/jlm src/inc/winapi.h
+;--- source file: C:\PROJECTS\JAIUSB\SRC\INC\winapi.h, last modified: 11/18/2026 13:16
+;--- cmdline used for creation: -b -y -o src/jlm src/inc/winapi.h
 
 ifndef WINAPI_H
 WINAPI_H	EQU	<>
@@ -219,7 +219,7 @@ ideown	WORD 8 dup (?)
 hcbdf	WORD 8 dup (?)
 hcirq	BYTE 8 dup (?)
 tsc_khz	DWORD	?
-if 0
+ifndef JLM
 vxdpath	SBYTE 92 dup (?)
 endif 
 units	winunit WIN_MAXUNITS dup (<>)
@@ -266,9 +266,10 @@ WINF_USBEJECT	EQU	0012h
 WINF_TBTREE	EQU	0013h
 WINF_DISKS	EQU	0020h
 WINF_RAWREAD	EQU	0021h
+WINF_UNITS	EQU	0022h
 WINF_CDREQ	EQU	0023h
 WINF_RAWIO	EQU	0024h
-WINF_UNITS	EQU	0022h
+WINF_BIOSMAP	EQU	0025h
 WINF_LOG	EQU	0030h
 WINF_SETOPT	EQU	0040h
 WINF_FLUSH	EQU	0041h
@@ -277,6 +278,8 @@ WINF_AUD_OPEN	EQU	0051h
 WINF_AUD_CTL	EQU	0052h
 WINF_AUD_MIX	EQU	0053h
 WINF_AUD_MIDI	EQU	0054h
+WINF_AUD_VOLS	EQU	0056h
+WINF_AUD_DSNODE	EQU	0057h
 WINF_CAM_DEVS	EQU	0060h
 WINF_CAM_MODES	EQU	0061h
 WINF_CAM_START	EQU	0062h
@@ -289,6 +292,12 @@ WINE_IO	EQU	3
 WINE_SMALL	EQU	4
 WINE_BUSY	EQU	5
 WINE_NOCORE	EQU	6
+winbiosmap	struct 
+disk	BYTE 8 dup (?)
+sectors	DWORD 8 dup (?)
+sectorshi	DWORD 8 dup (?)
+winbiosmap	ends
+
 winapireq	struct 
 fn	WORD	?
 status	WORD	?
@@ -333,6 +342,14 @@ MX_LINE	EQU	5
 MX_COUNT	EQU	6
 MX_SRC	EQU	100h
 MX_MUTE	EQU	101h
+winvolrec	struct 
+key	DWORD	?
+vol	DWORD 6 dup (?)
+insrc	BYTE	?
+mute	BYTE	?
+rsv	BYTE 2 dup (?)
+winvolrec	ends
+
 AC_START	EQU	1
 AC_PAUSE	EQU	2
 AC_RESET	EQU	3
@@ -463,6 +480,7 @@ UD_AUDIO	EQU	7
 UD_MIDI	EQU	8
 UD_TABLET	EQU	9
 UD_VIDEO	EQU	10
+UD_WDM	EQU	11
 winusbnode	struct 
 type_	BYTE	?
 depth	BYTE	?

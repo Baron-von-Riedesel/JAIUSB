@@ -6,8 +6,8 @@ set PATH=%WATCOM%\binnt;%PATH%
 set INCLUDE=%WATCOM%\h
 rem set directory where jwasm is to find jlm.inc
 set JEMMINC=\projects\jemm\include
-rem set CDEF=-q -mf -s -zl -ox -wx -we -zp4 -ei -DWIN_USB -DPKG_USB -D_DEBUG -Isrc\core -Isrc\inc -fobjlm\
-set CDEF=-q -mf -s -zl -ox -wx -we -zp4 -ei -DWIN_USB -DPKG_USB -Isrc\core -Isrc\inc -fobjlm\
+rem set CDEF=-q -mf -zl -ox -wx -we -zp4 -ei -DJLM -DWIN_USB -DPKG_USB -D_DEBUG -Isrc\core -Isrc\inc -fobjlm\
+set CDEF=-q -mf -zl -ox -wx -we -zp4 -ei -DJLM -DWIN_USB -DPKG_USB -Isrc\core -Isrc\inc -fobjlm\
 
 wcc386 -bt=windows %CDEF% src\core\winlib.c
 wcc386 -bt=windows %CDEF% src\core\pci.c
@@ -48,5 +48,13 @@ jwasm -q -I%JEMMINC% -Fobjlm/jlment.obj src/jlm/jlment.asm
 jwlink name bjlm/JAIUCORE.DLL @corejlm.lnk
 
 tools\h2incx.exe -b -y -o src/jlm src/inc/winapi.h
-jwasm -q -mz -D?MZ -Flbjlm/JAIUSB.lst -DPKG_USB -Fobjlm/JAIUSB.SYS src/jlm/winstor.asm
+jwasm -q -mz -D?MZ -DJLM -Flbjlm/JAIUSB.lst -DPKG_USB -Fobjlm/JAIUSB.SYS src/jlm/jlmstor.asm
 
+if not exist bjlm\tools\NUL mkdir bjlm\tools
+
+wcc -q -ml -bt=dos -DJLM -ox -wx -Isrc/inc -Itools -fo=bjlm/tools/ src/tools/wininfo.c
+wcc -q -ml -bt=dos -DJLM -ox -wx -Isrc/inc -Itools -fo=bjlm/tools/ src/tools/winfmt.c
+wcc -q -ml -bt=dos -DJLM -ox -wx -Isrc/inc -Itools -fo=bjlm/tools/ src/tools/winfs.c
+wcc -q -ms -bt=dos -DJLM -ox -wx -Isrc/inc -Itools -fo=bjlm/tools/ src/tools/dskbench.c
+wlink @jaiinfo.lnk
+wlink system dos name bjlm/tools/DSKBENCH.EXE file bjlm/tools/dskbench.obj op q,m=bjlm/tools/dskbench.map,stack=4096

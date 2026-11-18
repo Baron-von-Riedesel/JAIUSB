@@ -61,7 +61,8 @@ static int wait_rdy(struct nvme_ctrl *c, int want)
     while (((RD32(c->regs + NV_CSTS) & 1) != 0) != want) {
         if (RD32(c->regs + NV_CSTS) & 2) return -2;     /* fatal */
         if (plat_ms() - t0 > c->timeout_ms) return -1;
-        cpu_pause();
+        //cpu_pause();
+        Yield();
     }
     return 0;
 }
@@ -89,7 +90,8 @@ static int nvme_cmd(struct nvme_ctrl *c, struct nvme_q *q, u32 *cmd, u32 *dw0)
             kprintf("nvme: command %02x timeout CSTS=%08lx\n", cmd[0] & 0xFF, RD32(c->regs + NV_CSTS));
             return -1;
         }
-        cpu_pause();
+        //cpu_pause();
+        Yield();
     }
     st = (int)((cqe[3] >> 17) & 0x7FFF);
     if (dw0) *dw0 = cqe[0];

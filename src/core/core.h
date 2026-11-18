@@ -41,8 +41,17 @@ void irq_restore(u32 f);
 #pragma aux irq_restore = "push eax" "popfd" parm [eax] modify exact [];
 void cpu_pause(void);
 #pragma aux cpu_pause = "db 0F3h, 90h" modify exact [];
-u32 cpu_features(void);         /* CPUID 1 EDX (0 without CPUID leaf 1) */
-#pragma aux cpu_features = "xor eax,eax" "cpuid" "test eax,eax" "jz n" "mov eax,1" "cpuid" "mov eax,edx" "jmp x" \
+
+#ifdef JLM
+extern void __cdecl Yield(void);
+#else
+#define Yield() cpu_pause()
+#endif
+
+u32 cpu_features(void);         /* CPUID 1 EDX (0 without CPUID or leaf 1: Vortex86 DX ...) */
+#pragma aux cpu_features = "pushfd" "pop eax" "mov ecx,eax" "xor eax,200000h" "push eax" "popfd" "pushfd" "pop eax" \
+    "push ecx" "popfd" "xor eax,ecx" "test eax,200000h" "jz n" \
+    "xor eax,eax" "cpuid" "test eax,eax" "jz n" "mov eax,1" "cpuid" "mov eax,edx" "jmp x" \
     "n: xor eax,eax" "x:" value [eax] modify exact [eax ebx ecx edx];
 u32 cpu_rdmsr(u32 msr);          /* low dword of a model specific register */
 #pragma aux cpu_rdmsr = "db 0Fh, 32h" parm [ecx] value [eax] modify exact [eax edx];
@@ -60,6 +69,9 @@ void cpu_clflush(void *p);
 
 /* ---- platform services (platdos.c / platvxd.c) ---- */
 void plat_putc(char c);
+void mouse_speed(int *dx, int *dy);     /* WINUSB /SPEED:n on the relative motion of a pointing device */
+void plat_vol_saved(const void *recs, u32 len);   /* the saved mixer settings changed (winvolrec array) */
+void plat_mspeed_saved(u32 pct);                    /* the pointer speed was set (WINF_SETOPT 5) */
 void plat_screen(int on);
 void plat_mouse_abs(int x, int y, int dz, int dw, int buttons);   /* x, y 0..65535 */
 void plat_irq_detach(int irq);  /* stop using an IRQ (masked again) */       /* DOS: log to the text screen too */
@@ -67,11 +79,16 @@ u32 plat_ms(void);
 void plat_udelay(u32 us);
 void *plat_mmio(u32 phys, u32 len);
 void *plat_rm(u32 segoff);          /* real-mode seg:off -> linear in current context */
+struct winbridge;
+struct winbridge *plat_bridge_peer(void);   /* the other driver's sound bridge block, NULL none */
+void *plat_bridge_ring(struct winbridge *p); /* the ring of the producer's block p, here */
+void plat_bridge_publish(struct winbridge *own); /* VxD: the other VxD finds own */
 void *plat_sysrm(u32 segoff);       /* seg:off in the system VM (rings of WINSOUND.DRV) */
 void plat_key(const u8 *sc, int n);  /* deliver set-1 scan code bytes */
 void plat_mouse(int dx, int dy, int dz, int dw, int buttons);
 int plat_irq_attach(int irq);        /* returns 0 if attached */
 void plat_kick(void);                /* ask platform to call core_poll soon */
+int plat_pnp_ours(u32 bdf);           /* Windows 9x: the function's installed driver is this one */
 void plat_unit_changed(int unit);
 int plat_aux_irq(void);              /* DOS: aux bytes WINUSB.SYS caught on IRQ 12 (PS/2 touchpad) */
 void plat_aux_poll(void);            /* DOS: the PS/2 touchpad after BIOS calls, Windows, resets */
@@ -183,6 +200,7 @@ int blk_read_abs(struct blkdev *d, u64 lba512, u32 cnt512, void *buf);
 int blk_write_abs(struct blkdev *d, u64 lba512, u32 cnt512, const void *buf);
 int blk_dos_request(u8 *pkt);
 void blk_init(void);
+extern int blk_dosunits;
 void blk_explain(int nide, int nahci, int nnvme);
 #define CORENAME_STR "WINDISK"
 void blk_scan_fixed(void);
@@ -198,13 +216,14 @@ extern void (*blk_poll_hook)(void);   /* removable media without hot-plug events
    packet: one ATAPI/SCSI command of 12 bytes; data (len bytes, pool memory) flows to the
    host. Returns 0, 1 = check condition (sense data wanted), -1 = transport error. */
 typedef int (*cd_packet_fn)(void *priv, const u8 *cdb, void *buf, u32 len, u32 ms);
+#define CDP_OUT     0x80000000UL    /* len of a cd_packet_fn: the data goes to the drive */
 struct blkdev *cd_register(const char *model, const char *serial, u8 kind, u32 key, cd_packet_fn packet, void *priv);
 void cd_unregister(struct blkdev *d);
 int cd_count(void);
 struct blkdev *cd_unit(int u);
 int cd_dos_request(u8 *pkt);
 int cd_media(struct blkdev *d);     /* Windows 9x port driver: bit 0 medium, bits 8-15 changes */
-int cd_command(struct blkdev *d, const u8 *cdb, void *buf, u32 len, u8 *sense);
+int cd_command(struct blkdev *d, const u8 *cdb, void *buf, u32 len, u8 *sense);   /* len | CDP_OUT: data out */
 
 /* ---- disk controllers ---- */
 int ahci_probe(struct pcidev *p);

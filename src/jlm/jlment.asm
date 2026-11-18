@@ -3,6 +3,7 @@
 
 	.386
 	.MODEL FLAT, stdcall
+	option casemap:none
 
 	include jlm.inc
 	include winapi.inc
@@ -12,8 +13,11 @@ DLL_PROCESS_DETACH equ 0
 
 DEVICE_ID equ 3D34h
 
-PROCESSKQ equ 1
+;--- these 4 settings must match those in jlmstor.asm
+KQV86     equ 0
 POLLV86   equ 0
+IRQV86    equ 0
+INT15V86  equ 1	;must be 1, 0 not impl.
 
 externdef c ent_init:near
 externdef c ent_dos:near
@@ -31,10 +35,11 @@ FN_API          equ 4
 FN_SHUTDOWN     equ 5
 FN_RESUME       equ 6
 
-IRQ0  equ 1-POLLV86
-IRQ1  equ PROCESSKQ
-IRQ12 equ PROCESSKQ
-IRQX  equ 1
+IRQ0   equ 1-POLLV86
+IRQ1   equ 1-KQV86
+IRQ12  equ 1-KQV86
+IRQPM  equ 1-IRQV86
+YIELD  equ 1	;call Yield instead of just pause
 
 	.data
 
@@ -43,7 +48,7 @@ IRQX  equ 1
 ddb VxD_Desc_Block <0,0,DEVICE_ID,1,0,0,"JAIUSB",0, ctrlproc, v86_dispatch>
 
 vectors label dword
-if IRQ0 or IRQ1 or IRQ12 or IRQX
+if IRQ0 or IRQ1 or IRQ12 or IRQPM
 	dd my_init
 else
 	dd ent_init
@@ -52,12 +57,16 @@ endif
 	dd ent_poll
 	dd ent_irq
 	dd ent_api
-if IRQ0 or IRQ1 or IRQ12 or IRQX
+if IRQ0 or IRQ1 or IRQ12 or IRQPM
 	dd my_shutdown
 else
 	dd ent_shutdown
 endif
 	dd ent_resume
+
+if YIELD
+dwInYield dd 0
+endif
 
 	.CODE
 
@@ -107,12 +116,22 @@ PageCommitPhys proc c p1:dword, p2:dword, p3:dword, p4:dword
 	ret
 PageCommitPhys endp
 
-if 1
 Yield proc c
+if YIELD
+	add dwInYield, 1
+endif
+	push ebx
+	push ebp
+	@VMMCall Get_Cur_VM_Handle
+	mov ebp, [ebx].cb_s.CB_Client_Pointer
 	@VMMCall Yield
+	pop ebp
+	pop ebx
+if YIELD
+	sub dwInYield, 1
+endif
 	ret
 Yield endp
-endif
 
 	.data
 
@@ -137,16 +156,16 @@ specialcbs label dword
 endspecialcbs equ $
 endif
 
-vecs IRQS IRQX*8+IRQ0+IRQ1+IRQ12 dup (<>)
+vecs IRQS IRQPM*8+IRQ0+IRQ1+IRQ12 dup (<>)
 endvecs equ $
 
-if IRQ0 or IRQ1 or IRQ12 or IRQX
+if IRQ0 or IRQ1 or IRQ12 or IRQPM
 cb  dd 0
 endif
 
 	.code
 
-if IRQX
+if IRQPM
 
 ; unmask IRQ in PICs
 
@@ -218,9 +237,14 @@ cbppproc endp
 
  if IRQ0
 cbtmrproc proc
+  if YIELD
+	cmp [dwInYield],0
+	jnz @F
+  endif
 	push 0
 	call ent_poll
 	add esp, 4
+@@:
 	@VMMCall Simulate_Iret
 	clc
 	ret
@@ -276,7 +300,7 @@ specialcb endp
 
 endif
 
-if IRQ0 or IRQ1 or IRQ12 or IRQX
+if IRQ0 or IRQ1 or IRQ12 or IRQPM
 
 my_init proc
 	push [esp+4]
@@ -291,7 +315,7 @@ my_init proc
 	mov cb, esi
 
 	mov edi, offset vecs
- if IRQX
+ if IRQPM
 	xor ecx, ecx
 nextirq:
 	bt [esi].wincb.irqmask, cx
@@ -437,17 +461,36 @@ install proc
 	ret
 install endp
 
-uninstall proc
-if IRQ0 or IRQ1 or IRQ12 or IRQX
-	xor eax, eax
-	cmp cb, eax
-	jnz exit
+;--- since JAIUCORE had to replace Hook_V86_Int_Chain by
+;--- Allocate_V86_Call_Back combined with Set_V86_Int_Vector,
+;--- uninstall is possible only if none of the modified IVT vectors
+;--- has been modified - which is rather unlikely.
+
+uninstall proc uses esi
+if IRQ0 or IRQ1 or IRQ12 or IRQPM
+	mov esi, offset vecs
+nextentry:
+	cmp [esi].IRQS.cb, 0
+	jz done
+	movzx eax, [esi].IRQS.intno
+	@VMMCall Get_V86_Int_Vector
+	mov eax, ecx
+	shl eax, 16
+	mov ax, dx
+	cmp eax, [esi].IRQS.cb
+	jnz nouninst
+	add esi, sizeof IRQS
+	cmp esi, offset endvecs
+	jnz nextentry
+done:
 	pushad
 	call my_shutdown
 	popad
 endif
 	mov eax,1
-exit:
+	ret
+nouninst:
+	xor eax, eax
 	ret
 uninstall endp
 

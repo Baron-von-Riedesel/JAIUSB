@@ -232,7 +232,7 @@ struct wincb {                   /* 2048 bytes, lives in WINDISK.SYS / WINUSB.SY
     unsigned short hcbdf[8];    /* 328 USB controllers (bus << 8 | dev << 3 | fn) .. */
     unsigned char  hcirq[8];    /* 344 .. and their IRQs (0xFF none), for the real-mode IRQ code */
     unsigned long  tsc_khz;     /* 352 TSC frequency measured by the DOS core */
-#if 0
+#ifndef JLM
     char           vxdpath[92]; /* 356 .. 448 */
 #endif
     struct winunit units[WIN_MAXUNITS]; /* 448 .. 1984 old: 24*64=1536, new:16*92=1472, 1536-1472=64 bytes to adjust */
@@ -287,9 +287,10 @@ struct core_params {
 #define WINF_TBTREE      0x0013  /* buf: wintbnode array (Thunderbolt / USB4 host, routers, tunnels) */
 #define WINF_DISKS       0x0020
 #define WINF_RAWREAD     0x0021
+#define WINF_UNITS       0x0022  /* buf: winunit array (nunits entries), first drive in wininfo */
 #define WINF_CDREQ       0x0023  /* buf: DOS request header for the CD-ROM device (WINCD.SYS) */
 #define WINF_RAWIO       0x0024  /* arg0 disk | 80000000h write, arg1:arg2 LBA, buf/buflen: sectors */
-#define WINF_UNITS       0x0022  /* buf: winunit array (nunits entries), first drive in wininfo */
+#define WINF_BIOSMAP     0x0025  /* buf: winbiosmap: the BIOS disks on controllers the driver took */
 #define WINF_LOG         0x0030
 #define WINF_SETOPT      0x0040
 #define WINF_FLUSH       0x0041
@@ -300,6 +301,10 @@ struct core_params {
 #define WINF_AUD_CTL     0x0052  /* arg0 stream, arg1 AC_*, arg2 value */
 #define WINF_AUD_MIX     0x0053  /* arg0 dev, arg1 MX_* (| 0x80000000 set), arg2 value -> retlen value */
 #define WINF_AUD_MIDI    0x0054  /* arg0 dev (0xFF synthesizer), arg1 short message or buf/buflen */
+#define WINF_AUD_VOLS    0x0056  /* the saved mixer settings: arg0 0 get (buf: winvolrec array, retlen
+                                   bytes), 1 set (buf/buflen: winvolrec array, kept and applied) */
+#define WINF_AUD_DSNODE  0x0057  /* Windows 95/98/ME: arg0 dev -> retlen devnode of its DirectSound
+                                   driver (WINSOUND.DRV: DRV_QUERYDEVNODE) */
 
 /* USB video class cameras (WINUSB) */
 #define WINF_CAM_DEVS    0x0060  /* buf: wincamdev array */
@@ -317,6 +322,12 @@ struct core_params {
 #define WINE_SMALL       4
 #define WINE_BUSY        5
 #define WINE_NOCORE      6
+
+struct winbiosmap {              /* WINF_BIOSMAP: BIOS disk 80h + k is our disk disk[k] - 1 */
+    unsigned char  disk[8];
+    unsigned long  sectors[8];  /* 512-byte sectors (low 32 bits) */
+    unsigned long  sectorshi[8];
+};
 
 struct winapireq {               /* 32 bytes */
     unsigned short fn;
@@ -365,6 +376,16 @@ struct winring {                 /* 32-byte header + data, in conventional memor
 #define MX_COUNT        6
 #define MX_SRC          0x100   /* WINF_AUD_MIX: input source (AS_*) */
 #define MX_MUTE         0x101   /* WINF_AUD_MIX: master mute */
+
+/* mixer settings of one device, kept by the driver (WINF_AUD_VOLS): Windows 95/98/ME keep them
+   in the registry, DOS in WINAUDIO.VOL (AUDTEST MIX writes it, WINAUDIO.SYS loads it) */
+struct winvolrec {
+    unsigned long  key;         /* CRC of the device name, USB / PCI ids */
+    unsigned long  vol[6];      /* MX_MASTER .. MX_LINE */
+    unsigned char  insrc;       /* recording source (AS_*), 0 none */
+    unsigned char  mute;
+    unsigned char  rsv[2];
+};
 
 #define AC_START        1       /* WINF_AUD_CTL */
 #define AC_PAUSE        2
@@ -487,6 +508,7 @@ struct wintbnode {               /* 64 bytes */
 #define UD_MIDI     8
 #define UD_TABLET   9
 #define UD_VIDEO    10
+#define UD_WDM      11          /* given to its Windows driver through the WDM bridge (98 / ME) */
 
 struct winusbnode {              /* 160 bytes */
     unsigned char  type;        /* UN_* */

@@ -244,6 +244,28 @@ void udelay(u32 us)
     plat_udelay(us);
 }
 
+#if 0
+/* /SPEED:n (25..400 percent): the motion scaled, the remainders kept so that slow
+   movements are not lost */
+void mouse_speed(int *dx, int *dy)
+{
+#ifdef WIN_USB
+    static s32 rx, ry;
+    u32 pct = cb ? (u32)((struct windos *)((u8 *)cb + WIN_DOSOFF))->mspeed * 2 : 0;
+    s32 x, y;
+    if (!pct || pct == 100) return;
+    x = *dx * (s32)pct + rx;
+    y = *dy * (s32)pct + ry;
+    *dx = (int)(x / 100);
+    *dy = (int)(y / 100);
+    rx = x - (s32)*dx * 100;
+    ry = y - (s32)*dy * 100;
+#else
+    (void)dx; (void)dy;
+#endif
+}
+#endif
+
 void mdelay(u32 ms)
 {
     while (ms--) plat_udelay(1000);

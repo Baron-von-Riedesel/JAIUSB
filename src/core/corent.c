@@ -2,14 +2,15 @@
 #include "core.h"
 
 #ifdef WIN_USB
-#define CORENAME "JAIUSB"
+#define CORENAME "WINUSB"
 #include "audio.h"
 #include "usb.h"
 #elif defined(WIN_AUDIO)
-#define CORENAME "JAIAUDIO"
+#define CORENAME "WINAUDIO"
 #include "audio.h"
+#include "sbemu.h"
 #else
-#define CORENAME "JAIDISK"
+#define CORENAME "WINDISK"
 #endif
 
 struct wincb *cb;
@@ -36,13 +37,51 @@ int usb_hotplug_hc(struct pcidev *p);
 void usb_hotunplug_hc(u32 bdf);
 void usb_pci_list(struct pcidev *l, int n);
 
+#if defined(WIN_DISK) || defined(WIN_USB)
+/* DOS: the BIOS disks that are disks of ours on controllers we took over from the BIOS (USB;
+   NVMe with /NVME): their INT 13h calls are served by the driver from now on, the BIOS code
+   of those controllers no longer works (a USB boot disk would be lost: "Bad or missing ..."
+   for every file DOS reads from it afterwards). A disk matches by its first sector, once. */
+static int api_biosmap(struct winbiosmap *m)
+{
+    int i, k, hits, hit;
+    u8 *buf;
+    memset(m, 0, sizeof(*m));
+    if (plat_mode != PM_DOS || !cb->nbios) return WINE_OK;
+    buf = kmalloc_align(4096, 4096);
+    if (!buf) return WINE_IO;
+    for (k = 0; k < cb->nbios && k < 8; k++) {
+        hits = 0;
+        hit = -1;
+        if (!cb->biosmbr[k]) continue;
+        for (i = 0; i < blk_count(); i++) {
+            struct blkdev *d = blk_get(i);
+            if (!d || !d->present || d->cdrom || d->ssize != 512) continue;
+            if (d->kind != DK_USB && !(d->kind == DK_NVME && (cb->opts & OPT_NVME))) continue;
+            if (blk_read_abs(d, 0, 1, buf) || crc32(0, buf, 512) != cb->biosmbr[k]) continue;
+            hits++;
+            hit = i;
+        }
+        if (hits == 1) {
+            struct blkdev *d = blk_get(hit);
+            m->disk[k] = (u8)(hit + 1);
+            m->sectors[k] = (u32)d->sectors;
+            m->sectorshi[k] = (u32)(d->sectors >> 32);
+            if (!d->shared) d->shared = (u8)(k + 1);
+            kprintf("BIOS disk %02xh is disk%d (%s): its INT 13h calls are served here\n", 0x80 + k, hit, d->model);
+        }
+    }
+    kfree(buf);
+    return WINE_OK;
+}
+#endif
+
 #ifdef WIN_DISK
 static void match_bios_disks(u8 *mbrs)
 {
     int i, k;
     u8 *buf;
-    for (k = 0; k < cb->nbios && k < 8; k++)
-        cb->biosmbr[k] = crc32(0, mbrs + k * 512, 512);
+    (void)mbrs;
     buf = kmalloc_align(4096, 4096);
     for (i = 0; i < blk_count(); i++) {
         struct blkdev *d = blk_get(i);
@@ -80,6 +119,7 @@ static int is_ahci(struct pcidev *d)
 #include "dsp.h"
 static int fw_wait;
 static void audio_start(void);
+static void audio_summary(void);
 
 /* WINAUDIO.SYS loaded the firmware files the core asked for: the sound devices start */
 int core_filedone(void)
@@ -117,11 +157,43 @@ static void audio_start(void)
             /* Intel DSP (SST / SOF) functions keep HD Audio registers in BAR0 */
             if (d->vendor == 0x8086 && pci_bar_mem(d, 0, NULL) && !(cb->opts & OPT_NOHDA) && hda_probe(d) == 0)
                 continue;
+            if (d->sub == 1 && (es137x_probe(d) == 0 || emu10k_probe(d) == 0)) continue;
             if (d->sub == 1 && !(cb->opts & OPT_NOAC97)) ac97_probe(d);
         }
     }
     core_flags |= CF_AUDIO;
+    aeng_bridge_probe();                /* a USB Audio device of WINUSB */
     if (adev_count()) cb->flags |= CBF_HAVEDISK;
+    sb_start(plat_mode == PM_VXD);
+    audio_summary();
+}
+
+/* DOS, at boot: what was found, on the screen */
+static void audio_summary(void)
+{
+    static int done;
+    int i;
+    if (plat_mode != PM_DOS || done) return;
+    done = 1;
+    plat_screen(1);
+    for (i = 0; i < 8; i++) {
+        struct adev *a = adev_get(i);
+        if (!a) continue;
+        kprintf(CORENAME ": %s\n", a->name);
+        if (a->pcivid)
+            kprintf(CORENAME ":   %s %04x:%04x at PCI %02x:%02x.%x, IRQ %d, %lu Hz\n",
+                    a->type == AT_HDA ? "HD Audio" : a->type == AT_ENS ? "AudioPCI" : a->type == AT_EMU ? "EMU10K" : "AC'97", a->pcivid, a->pcidid, a->loc >> 8, (a->loc >> 3) & 31,
+                    a->loc & 7, a->irq, a->out.rate);
+    }
+    {
+        /* USB Audio through WINUSB: wanted (/USBSB) or the only way, but not there */
+        const char *why = aeng_bridge_why();
+        int own = 0;
+        for (i = 0; i < 8; i++)
+            if (adev_get(i) && !adev_get(i)->hidden) own++;
+        if (why && (!own || (cb->opts2 & OPT2_USBSB))) kprintf(CORENAME ": USB Audio: %s\n", why);
+    }
+    plat_screen((cb->opts & OPT_SCREEN) != 0);
 }
 #endif
 
@@ -139,6 +211,23 @@ int core_init(struct core_params *p)
             p->pool_size >> 10, p->pool_phys);
     blk_init();
     if (plat_mode == PM_VXD) blk_adopt_units();
+    if (plat_mode == PM_DOS && p->mbr_lin) {
+        /* first sectors of the BIOS disks: the disks DOS already uses (and serves) */
+        int k;
+        for (k = 0; k < cb->nbios && k < 8; k++) {
+            /* loaded high, the DOS driver read every sector twice: into its upper memory block
+               (right for BIOS code running in V86 mode) and into the HMA (right for BIOS code
+               writing to physical memory: 32-bit or SMM disk code, bus master USB); the copy
+               with a boot signature counts */
+            u8 *a = (u8 *)p->mbr_lin + k * 512;
+            if (p->rsv[0] && !(a[510] == 0x55 && a[511] == 0xAA)) {
+                u8 *b = (u8 *)p->rsv[0] + k * 512;
+                if (b[510] == 0x55 && b[511] == 0xAA) a = b;
+            }
+            cb->biosmbr[k] = crc32(0, a, 512);
+        }
+        DBG("dos: %u BIOS disk(s), first sectors at %08lx / %08lx\n", cb->nbios, p->mbr_lin, p->rsv[0]);
+    }
     /* DOS start, before Windows and its drivers see the machine: the PCI resources of the
        devices WINDRV drives that the firmware put above 4G are moved below 4G (the first
        WINDRV driver loaded does it; /ALL4G: of every device) */
@@ -151,6 +240,7 @@ int core_init(struct core_params *p)
            the I/O Supervisor gives the drive letters */
         pnp_mode = 1;
         core_flags |= CF_DISK | CF_PNP;
+        blk_dosunits = 0;
     }
     for (i = 0; i < npci && !pnp_mode; i++) {
         struct pcidev *d = &pcis[i];
@@ -186,6 +276,7 @@ int core_init(struct core_params *p)
         pnp_mode = 1;
         sst_probe(pcis, npci);              /* an ACPI device: the Configuration Manager has none */
         if (adev_count()) cb->flags |= CBF_HAVEDISK;
+        sb_start(1);
     } else {
         if (plat_mode == PM_DOS && !(cb->opts2 & OPT2_NODSP)) {
             /* firmware of the Intel audio DSPs: WINAUDIO.SYS loads the files into XMS (also
@@ -202,13 +293,14 @@ int core_init(struct core_params *p)
     if (p->flags & CPF_PNP) {
         /* Windows 95/98/ME: the controllers come one by one from the Configuration Manager */
         core_flags |= CF_USB | CF_AUDIO | CF_I2C | CF_PNP;
-        aeng_init();
+        blk_dosunits = 0;
+        //aeng_init();
         usb_init();
         pnp_mode = 1;
         i2c_start(pcis, 0);                 /* touchpads on ACPI-only I2C controllers (no PCI function) */
     } else if (plat_mode == PM_VXD || (cb->opts & OPT_USB)) {
         core_flags |= CF_USB | CF_AUDIO;
-        aeng_init();                    /* USB Audio devices */
+        //aeng_init();                    /* USB Audio devices */
         usb_init();
         usb_start_all(pcis, npci);
         i2c_start(pcis, npci);              /* HID over I2C touchpads */
@@ -222,7 +314,7 @@ int core_init(struct core_params *p)
     if (plat_mode == PM_DOS) blk_scan_fixed();
 #endif
 #ifdef WIN_DISK
-    if (plat_mode == PM_DOS && !cb->nfixed) {
+    if (plat_mode == PM_DOS && !cb->nfixed && !(cb->flags & CBF_QUIET)) {
         plat_screen(1);
         blk_explain(nide, nahci, nnvme);
         plat_screen((cb->opts & OPT_SCREEN) != 0);
@@ -358,6 +450,10 @@ int core_pnp_start(const u32 *bdfs, int n)
                 started++;
                 continue;
             }
+            if (d->sub == 1 && (es137x_probe(d) == 0 || emu10k_probe(d) == 0)) {
+                started++;
+                continue;
+            }
             if (d->sub == 1 && !(cb->opts & OPT_NOAC97) && ac97_probe(d) == 0) started++;
         }
     }
@@ -383,6 +479,8 @@ void core_pnp_stop(u32 bdf)
 #else
     hda_remove(bdf);
     ac97_remove(bdf);
+    es137x_remove(bdf);
+    emu10k_remove(bdf);
 #endif
 }
 
@@ -405,7 +503,16 @@ int core_pnp_start_boot(void)
         if ((d->cls == 1 && d->sub != 1 && (is_ahci(d) || (d->sub == 8 && d->prog == 2))) ||
             (d->cls == 8 && d->sub == 5 && d->prog <= 2))
 #endif
+        {
+            /* only the controllers Windows has this driver installed for: the others belong
+               to Windows' own drivers (UHCD / OPENHCI / USBEHCI, ESDI_506 ...), which start
+               them too */
+            if (!plat_pnp_ours(PCI_BDF(d))) {
+                kprintf("pnp: %02x:%02x.%x has another driver, not started at boot\n", d->bus, d->dev, d->fn);
+                continue;
+            }
             bdfs[n++] = PCI_BDF(d);
+        }
     }
     r = core_pnp_start(bdfs, n);
     for (i = 0; i < n && nearly < (int)ARRAY_SIZE(early_bdf); i++) early_bdf[nearly++] = bdfs[i];
@@ -474,7 +581,7 @@ void core_shutdown(int how)
     if (!(core_flags & CF_STARTED)) return;
     kprintf(CORENAME " shutdown\n");
 #ifdef WIN_USB
-    if (core_flags & CF_AUDIO) aeng_shutdown();
+    //if (core_flags & CF_AUDIO) aeng_shutdown();
     if (core_flags & CF_I2C) i2c_shutdown();
     if (core_flags & CF_USB) {
         tbt_shutdown();
@@ -509,7 +616,7 @@ void core_resume(void)
     if (cb->opts & OPT_USB) audio_start();
 #else
     if (core_flags & CF_USB) {
-        aeng_init();
+        //aeng_init();
         usb_init();
         usb_start_all(pcis, npci);
         i2c_start(pcis, npci);              /* HID over I2C touchpads */
@@ -571,12 +678,18 @@ int core_api(struct winapireq *r)
 #endif
         in->poolfree = pool_free_bytes();
         in->uptime_ms = plat_ms() - start_ms;
-        strlcpy(in->build, "WINDRV 1.0 " __DATE__, sizeof(in->build));
+        strlcpy(in->build, "WINDRV 1.2 " __DATE__, sizeof(in->build));
         r->retlen = sizeof(*in);
         return WINE_OK;
     }
     case WINF_DISKS:
         return api_disks(buf, r->buflen, &r->retlen);
+#if defined(WIN_DISK) || defined(WIN_USB)
+    case WINF_BIOSMAP:
+        if (!buf || r->buflen < sizeof(struct winbiosmap)) return WINE_SMALL;
+        r->retlen = sizeof(struct winbiosmap);
+        return api_biosmap((struct winbiosmap *)buf);
+#endif
 #if defined(WIN_DISK) || defined(WIN_USB)
     case WINF_CDREQ:
         /* request header of WINCD.SYS / WINUCD.SYS, the DOS CD-ROM devices for MSCDEX */
@@ -677,12 +790,24 @@ int core_api(struct winapireq *r)
         if (!(core_flags & CF_USB)) return WINE_NOCORE;
         return uvc_api(r, buf);
 #endif
-#if defined(WIN_AUDIO) || defined(WIN_USB)
+//#if defined(WIN_AUDIO) || defined(WIN_USB)
+#if defined(WIN_AUDIO)
     case WINF_AUD_DEVS:
     case WINF_AUD_OPEN:
     case WINF_AUD_CTL:
     case WINF_AUD_MIX:
     case WINF_AUD_MIDI:
+    case WINF_AUD_VOLS:
+#ifdef WIN_AUDIO
+    case WINF_AUD_SB:
+        if (r->fn == WINF_AUD_SB) {
+            u32 n = MIN(r->buflen, (u32)sizeof(struct winsb));
+            if (!buf) return WINE_SMALL;
+            memcpy(buf, (u8 *)cb + WIN_SBOFF, n);
+            r->retlen = n;
+            return WINE_OK;
+        }
+#endif
         if (!(core_flags & CF_AUDIO)) return WINE_NOCORE;
         if (r->fn == WINF_AUD_DEVS && !buf) return WINE_SMALL;
         return aeng_api(r, buf);

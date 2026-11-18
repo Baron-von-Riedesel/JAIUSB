@@ -4,7 +4,10 @@
    The touchpad is switched from mouse mode to touchpad mode (feature "Input Mode" = 3),
    then the contacts are turned into mouse events:
      one finger moves the pointer, a short tap clicks (two fingers: right, three: middle);
+     tap and touch again at once: the left button stays down while the finger moves (drag),
+     two quick taps: a double click;
      two fingers moving up or down turn the wheel, sideways the horizontal wheel;
+     three fingers swiping sideways: back (to the right) and forward (to the left);
      the pad's button clicks left, right with two fingers on the pad. */
 #ifndef USB_H
 #include "usb.h"
@@ -15,9 +18,11 @@
 #define MAXCONTACT  10
 #define CPMM        8           /* pointer counts per millimetre */
 #define SCROLL_UM   2500        /* finger travel per wheel notch, micrometres */
-#define TAP_MS      200
-#define TAP_UM      2500
+#define TAP_MS      300         /* a tap: the finger lifted within this time ... */
+#define TAP_UM      3000        /* ... and never this far from where it touched (micrometres) */
 #define CLICK_MS    50
+#define DRAG_MS     180         /* a single tap holds the button this long: touch again to drag */
+#define SWIPE_UM    12000       /* three-finger travel sideways for back / forward */
 
 struct pfield {
     s16 off;                    /* bit offset after the report ID, -1: none */
@@ -59,7 +64,8 @@ struct ptp {
     /* gesture state */
     u32 t_down;
     int maxn;
-    u32 travel;                 /* micrometres moved during this touch */
+    u32 travel;                 /* the farthest the touch got from where it began, micrometres */
+    s32 netx, nety;             /* where it is now from there, micrometres */
     s32 kx, ky;                 /* pointer counts across the whole pad */
     s32 nx, ny;                 /* wheel notches across the whole pad, * 16 */
     s32 rx, ry;                 /* pointer remainders: units * kx, ky */
@@ -69,6 +75,9 @@ struct ptp {
     int tapbtn;
     s32 tdx, tdy;               /* pointer counts of this touch (debug log) */
     u32 tapup;                  /* plat_ms() when the tap click ends */
+    u8 dragging;                /* tap and drag: the left button is held for this touch */
+    u8 swiped;                  /* back / forward given for this touch */
+    s32 swx;                    /* three-finger sideways travel of this touch, micrometres */
     void (*out)(int dx, int dy, int dz, int dw, int buttons);
 };
 
@@ -357,7 +366,7 @@ static s32 to_um(struct ptp *p, s32 d, int y)
 
 static void emit(struct ptp *p, s32 dx, s32 dy, int dz, int dw)
 {
-    int b = p->btnheld | (p->tapup ? p->tapbtn : 0);
+    int b = p->btnheld | (p->tapup ? p->tapbtn : 0) | (p->dragging ? 1 : 0);
     p->out((int)dx, (int)dy, dz, dw, b);
 }
 
@@ -365,23 +374,54 @@ static void frame(struct ptp *p)
 {
     struct contact *c = p->cur;
     int n = p->ncur, i, k, matched = 0;
-    s32 mx = 0, my = 0;
+    s32 mx = 0, my = 0, bx = 0, by = 0, best = -1;
     u32 now = p->scan.off >= 0 ? p->devms : plat_ms();   /* reports may arrive in bursts */
     s32 dx = 0, dy = 0;
-    int dz = 0, dw = 0;
-    /* movement of the contacts that were there before */
-    for (i = 0; i < n && i < 2; i++)
+    int dz = 0, dw = 0, point;
+    /* movement of the contacts that were there before (bx, by: the one that moved most) */
+    for (i = 0; i < n && i < MAXCONTACT; i++)
         for (k = 0; k < p->nprev; k++)
             if (p->prev[k].id == c[i].id) {
-                mx += c[i].x - p->prev[k].x;
-                my += c[i].y - p->prev[k].y;
-                matched++;
+                s32 ex = c[i].x - p->prev[k].x, ey = c[i].y - p->prev[k].y;
+                s32 m = (ex < 0 ? -ex : ex) + (ey < 0 ? -ey : ey);
+                if (i < 2) {
+                    mx += ex;
+                    my += ey;
+                    matched++;
+                }
+                if (m > best) {
+                    best = m;
+                    bx = ex;
+                    by = ey;
+                }
                 break;
             }
+    /* One finger moves the pointer. So does the moving finger while a button is held (the
+       thumb on the button, or on the button area at the bottom of a clickpad, is a second
+       contact that must not turn the motion into scrolling or halve it). */
+    point = n == 1 || (n >= 2 && (p->curbtn || p->btnheld || p->dragging));
+    if (!point && n == 2 && matched == 2) {
+        for (i = 0; i < 2; i++)
+            if (c[i].y > p->yrange - p->yrange / 6) {
+                s32 ex = 0, ey = 0;
+                for (k = 0; k < p->nprev; k++)
+                    if (p->prev[k].id == c[i].id) ex = c[i].x - p->prev[k].x, ey = c[i].y - p->prev[k].y;
+                if ((ex < 0 ? -ex : ex) + (ey < 0 ? -ey : ey) <= p->xrange / 200) point = 1;
+            }
+    }
     if (n && !p->nprev) {                           /* touch begins */
+        /* right after a single tap, whose click is still held: tap and drag */
+        if (p->tapup && p->tapbtn == 1) {
+            p->tapup = 0;
+            if (n == 1) p->dragging = 1;
+            else emit(p, 0, 0, 0, 0);               /* more fingers: the click ends now */
+        }
+        p->swiped = 0;
+        p->swx = 0;
         p->t_down = now;
         p->maxn = 0;
         p->travel = 0;
+        p->netx = p->nety = 0;
         p->rx = p->ry = p->sx = p->sy = 0;
         p->tdx = p->tdy = 0;
         p->clicked = 0;
@@ -390,15 +430,31 @@ static void frame(struct ptp *p)
     if (n != p->nprev) p->sx = p->sy = 0;           /* finger count changed: new gesture */
     if (matched) {
         s32 ux = to_um(p, mx / matched, 0), uy = to_um(p, my / matched, 1);
-        p->travel += (u32)(ux < 0 ? -ux : ux) + (u32)(uy < 0 ? -uy : uy);
+        u32 dist;
+        /* the distance from where the touch began, not the path: the small jitter of a
+           finger at rest must not make a tap a movement */
+        p->netx += ux;
+        p->nety += uy;
+        dist = (u32)(p->netx < 0 ? -p->netx : p->netx) + (u32)(p->nety < 0 ? -p->nety : p->nety);
+        if (dist > p->travel) p->travel = dist;
         /* exact: remainders kept in units times the scale */
-        if (n == 1) {
-            p->rx += mx / matched * p->kx;
-            p->ry += my / matched * p->ky;
+        if (point) {
+            p->rx += bx * p->kx;
+            p->ry += by * p->ky;
             dx = p->rx / p->xrange;
             dy = p->ry / p->yrange;
             p->rx -= dx * p->xrange;
             p->ry -= dy * p->yrange;
+        } else if (n >= 3) {
+            /* three fingers sideways: back / forward once per touch */
+            p->swx += ux;
+            if (!p->swiped && (p->swx > SWIPE_UM || p->swx < -SWIPE_UM)) {
+                p->swiped = 1;
+                p->tapbtn = p->swx > 0 ? 8 : 16;
+                p->tapup = plat_ms() + CLICK_MS;
+                if (!p->tapup) p->tapup = 1;
+                DBG2("ptp: three-finger swipe, button %d\n", p->tapbtn);
+            }
         } else if (n == 2) {
             s32 ux16 = p->xrange * 16, uy16 = p->yrange * 16;
             p->sx += mx / matched * p->nx;
@@ -421,11 +477,25 @@ static void frame(struct ptp *p)
         DBG2("ptp: pad button up, %d contact(s)\n", n);
     }
     /* tap: short touch without travel and without the pad button */
-    if (!n && p->nprev && now - p->t_down < TAP_MS && p->travel < TAP_UM && !p->clicked && !p->curbtn) {
-        p->tapbtn = p->maxn >= 3 ? 4 : p->maxn == 2 ? 2 : 1;
-        p->tapup = plat_ms() + CLICK_MS;   /* ptp_tick ends it */
+    if (!n && p->nprev && now - p->t_down < TAP_MS && p->travel < TAP_UM && !p->clicked && !p->curbtn &&
+        !p->swiped) {
+        if (p->dragging) {
+            /* the second tap of a double tap: release, then the second click */
+            p->dragging = 0;
+            emit(p, 0, 0, 0, 0);
+            p->tapbtn = 1;
+            p->tapup = plat_ms() + CLICK_MS;
+        } else {
+            p->tapbtn = p->maxn >= 3 ? 4 : p->maxn == 2 ? 2 : 1;
+            /* a single tap holds its click a little longer: a touch meanwhile drags */
+            p->tapup = plat_ms() + (p->tapbtn == 1 ? DRAG_MS : CLICK_MS);   /* ptp_tick ends it */
+        }
         if (!p->tapup) p->tapup = 1;
         DBG2("ptp: tap, button %d\n", p->tapbtn);
+    }
+    if (!n && p->nprev && p->dragging) {
+        p->dragging = 0;                            /* drag ends with the touch */
+        DBG2("ptp: drag ends\n");
     }
     if (dz || dw) DBG2("ptp: wheel %d %d\n", dz, dw);
     p->tdx += dx;

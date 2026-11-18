@@ -526,6 +526,7 @@ void blk_scan_fixed(void)
     if (scanned) return;
     scanned = 1;
     cb->nunits = 0;
+    dprintf(("blk_scan_fixed: enter\n"));
     if (cb->opts2 & OPT2_NODISK) {
         kprintf("no DOS drive letters (MS-DOS 7: Windows owns the disks, /DOSDISK for DOS)\n");
         cb->nfixed = cb->nslots = 0;
@@ -533,6 +534,7 @@ void blk_scan_fixed(void)
     }
     for (i = 0; i < ndisks; i++) {
         struct blkdev *d = disks[i];
+        dprintf(("blk_scan_fixed(%u): removable=%u cdrom=%u kind=%u shared=%u\n", i, d->removable, d->cdrom, d->kind, d->shared));
         if (d->removable || d->cdrom) continue;
         if (d->kind == DK_IDE && d->shared) {
             /* the IDE channel belongs to the BIOS (and to WDCTRL in Windows) */
@@ -549,6 +551,7 @@ void blk_scan_fixed(void)
                 kprintf("  part %d @%lu already mounted by DOS, skipped\n", j, (u32)pe[j].start);
                 continue;
             }
+            kprintf("  part %d @%lu not mounted by DOS, usable\n", j, (u32)pe[j].start);
             if (add_unit(UT_FIXED, d, &pe[j], j) < 0) break;
             why[i] = 0;
         }
@@ -575,6 +578,7 @@ void blk_scan_fixed(void)
     /* removable disks known at init (USB in DOS mode) go into slots */
     for (i = 0; i < ndisks; i++)
         if (disks[i]->removable) blk_register(disks[i]);
+    dprintf(("blk_scan_fixed: exit\n"));
 }
 
 /* WINDISK found nothing to serve: say what it saw, on the screen */
@@ -680,7 +684,7 @@ static int slot_attach(struct blkdev *d)
 int blk_register(struct blkdev *d)
 {
     int i = disk_index(d);
-    dprintf(("blk_register i=%d, ndisks=%u\n", i, ndisks));
+    dprintf(("blk_register i=%d, ndisks=%u, d->removable=%u scanned=%u\n", i, ndisks, d->removable, scanned));
     if (i < 0) {
         if (ndisks >= MAXDISKS) return -1;
         /* reuse a hole left by an unplugged disk */

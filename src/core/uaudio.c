@@ -125,10 +125,17 @@ static void fu_set(struct ua *u, u8 fu, u8 ctl, u8 ch, s16 v, int bytes)
     ac_req(u, 0x21, 0x01, (u16)(((u16)ctl << 8) | ch), fu, b, (u16)bytes);
 }
 
-/* 0..65535 -> dB: the top 60 dB of the range, 0 = mute */
-static s16 to_db(u32 v, s16 mn, s16 mx)
+/* 0..65535 -> dB (1/256): the volume (master) is linear in amplitude, the recording gain
+   spreads over the top 60 dB of the range */
+static s16 to_db(u32 v, s16 mn, s16 mx, int amp)
 {
-    s32 range = (s32)mx - mn;
+    s32 range = (s32)mx - mn, d;
+    if (amp) {
+        u32 a = aeng_att_cdb(v);
+        if (a == 0xFFFFFFFFUL) return mn;
+        d = (s32)mx - (s32)((a * 256UL) / 100);
+        return (s16)(d < mn ? mn : d);
+    }
     if (range > 60 * 256) range = 60 * 256;
     return (s16)((s32)mx - (s32)(((u32)(65535 - v) * (u32)range) / 65535));
 }
@@ -145,10 +152,10 @@ static void ua_set_vol(struct adev *a, int ctl, u32 lr)
     if (f->mute != 0xFF) fu_set(u, f->id, 1, f->mute, (s16)(!l && !r), 1);
     if (f->vol == 0xFF) return;
     if (f->vol == 0) {
-        fu_set(u, f->id, 2, 0, to_db(MAX(l, r), u->vmin[k], u->vmax[k]), 2);
+        fu_set(u, f->id, 2, 0, to_db(MAX(l, r), u->vmin[k], u->vmax[k], k == 0), 2);
     } else {
-        fu_set(u, f->id, 2, f->vol, to_db(l, u->vmin[k], u->vmax[k]), 2);
-        if (f->vol2 != 0xFF) fu_set(u, f->id, 2, f->vol2, to_db(r, u->vmin[k], u->vmax[k]), 2);
+        fu_set(u, f->id, 2, f->vol, to_db(l, u->vmin[k], u->vmax[k], k == 0), 2);
+        if (f->vol2 != 0xFF) fu_set(u, f->id, 2, f->vol2, to_db(r, u->vmin[k], u->vmax[k], k == 0), 2);
     }
 }
 
@@ -351,7 +358,7 @@ static int choose_alt(struct ua *u, u8 *ifd, u8 *end, struct ualt *best, int dir
     u8 *p = ifd;
     int bestscore = -1;
     for (; p && p + 2 <= end && p[0]; p += p[0]) {
-        u8 *q, *ep = NULL, *fb = NULL, ch = 0, sub = 0, bits = 0, term = 0, eprate = 0, clk = 0;
+        u8 *q, *ep = NULL, *fb = NULL, ch = 0, sub = 0, bits = 0, term = 0, eprate = 0, clk = 0, gen = 0, ftype = 0;
         u32 rates[16], lo = 0, hi = 0, rate;
         int nr = 0, pcm = 0, score, i;
         if (p[1] != 4) continue;
@@ -359,6 +366,7 @@ static int choose_alt(struct ua *u, u8 *ifd, u8 *end, struct ualt *best, int dir
         if (p[3] == 0 || p[5] != 1 || p[6] != 2) continue;
         for (q = p + p[0]; q + 2 <= end && q[0] && q[1] != 4; q += q[0]) {
             if (q[1] == 0x24 && q[2] == 1) {
+                gen = 1;
                 term = q[3];
                 if (u->uac2) {
                     pcm = q[0] >= 10 && (q[6] & 1) && q[5] == 1;
@@ -367,6 +375,7 @@ static int choose_alt(struct ua *u, u8 *ifd, u8 *end, struct ualt *best, int dir
                     pcm = (q[5] | (q[6] << 8)) == 1;
                 }
             } else if (q[1] == 0x24 && q[2] == 2 && q[3] == 1) {
+                ftype = 1;
                 if (u->uac2) {
                     sub = q[4];
                     bits = q[5];
@@ -389,11 +398,17 @@ static int choose_alt(struct ua *u, u8 *ifd, u8 *end, struct ualt *best, int dir
                 eprate = q[3] & 1;
             }
         }
-        if (!pcm || !ep || !ch || (sub != 2 && sub != 3 && sub != 4)) continue;
-        if (((ep[2] & 0x80) != 0) != dir) continue;
+        /* some devices leave out the general descriptor (or give no format tag in it): a
+           type I format is PCM */
+        if (!pcm && ftype && (!gen || !u->uac2)) pcm = 1;
+        if (ep && ((ep[2] & 0x80) != 0) != dir) continue;
         if (u->uac2) nr = clock_rates(u, term, rates, 16, &clk);
         rate = pick_rate(rates, nr, lo, hi);
-        if (!rate) continue;
+        if (!pcm || !ep || !ch || (sub != 2 && sub != 3 && sub != 4) || !rate) {
+            kprintf("uaudio:   if %u alt %u not usable: format %u%s, %u ch, %u bytes, %lu Hz, %s\n", p[2], p[3],
+                    ftype, pcm ? " PCM" : "", ch, sub, rate, ep ? "endpoint" : "no isochronous endpoint");
+            continue;
+        }
         score = (ch == 2 ? 100 : ch > 2 ? 50 : 30) + (sub == 2 ? 20 : sub == 3 ? 15 : 10) +
                 (rate == 48000 ? 8 : rate == 44100 ? 6 : 2);
         if (score > bestscore) {
@@ -742,6 +757,7 @@ static int probe_midi(struct usb_dev *d, u8 *ifd, u8 *end)
     u->a.type = AT_USB;
     u->a.caps = WINAC_MIDI;
     u->a.midiout = 1;
+    u->a.usbid = d->id;
     adev_register(&u->a);
     if (d->driver == UD_NONE) d->driver = UD_MIDI;
     kprintf("uaudio: dev %u MIDI output on interface %u\n", d->id, ifd[2]);
@@ -784,7 +800,10 @@ static int ua_probe(struct usb_dev *d, u8 *ifd, u8 *end)
             got |= 2;
         }
     }
-    if (!got) return -1;
+    if (!got) {
+        kprintf("uaudio: dev %u: no stream it can play or record\n", d->id);
+        return -1;
+    }
     u->used = 1;
     if (!u->rings) u->rings = kmalloc_align(RINGSZ * 2, 4096);
     if (!u->rings) return -1;
@@ -847,6 +866,7 @@ static int ua_probe(struct usb_dev *d, u8 *ifd, u8 *end)
     u->a.type = AT_USB;
     u->a.hwvol = (u8)(u->ofu != 0);
     u->a.midiout = 0;
+    u->a.usbid = d->id;
     name_dev(u, d, "");
     d->driver = UD_AUDIO;
     d->drvinfo = (u8)(u->uac2 ? 2 : 1);

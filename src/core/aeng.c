@@ -3,9 +3,14 @@
    in a VxD, where the FPU belongs to the virtual machines. */
 #include "audio.h"
 #include "srctab.h"
+#ifdef WIN_AUDIO
+#include "sbemu.h"
+#define SB_ON() sb_active()
+#else
+#define SB_ON() 0
+#endif
 
-#define MAXADEV     8
-#define MAXSTREAM   16
+#define MAXSTREAM   32
 #define CHUNK       256             /* output frames per mixing step */
 #define MAXIN       (CHUNK * 4 + 8) /* input frames for one step (down to 1/4) */
 
@@ -25,7 +30,17 @@ struct astream {
     u32 vl, vr;                     /* 0..65536 */
     u32 lastfill;                   /* device byte count where the stream's data ends */
     struct rsmp rs;
+    struct winring *direct;         /* internal stream (Sound Blaster emulation): its ring */
+    u8 rt;                          /* produced in real time: never limits how far ahead we mix */
+    u8 volctl;                      /* MX_* that scales it */
+    u8 ds;                          /* DirectSound: DS_PRIMARY, DS_SECONDARY */
+    u8 loop;                        /* DirectSound secondary buffer: plays round and round */
+    u8 *data;                       /* DirectSound: the buffer (else the ring's data) */
+    u32 dspos;                      /* DirectSound secondary buffer: where it starts playing */
 };
+#define DS_GUARD        40      /* ms between the engine and the primary buffer's write cursor */
+#define DS_PRIMARY      1
+#define DS_SECONDARY    2
 
 static struct adev *adevs[MAXADEV];
 static struct astream streams[MAXSTREAM];
@@ -34,13 +49,29 @@ static s16 tin[MAXIN * 2];
 static s16 tout[CHUNK * 4 * 2];
 static int flush_mode;              /* 0 unknown, 1 clflush, 2 wbinvd */
 static int synth_dev = -1;          /* device the synthesizer plays on */
+static int rt_dev = -1;             /* device of the internal streams */
+static u8 lowlat;                   /* DOS: serviced often (RTC), short latency */
 
 /* ---------------------------------------------------------------- helpers */
 
-static s16 clip16(s32 v)
+static s16 hard16(s32 v)
 {
     if (v > 32767) return 32767;
     if (v < -32768) return -32768;
+    return (s16)v;
+}
+
+/* soft limit above -1.2 dB: loud mixes of several streams round off instead of clipping */
+static s16 clip16(s32 v)
+{
+    if (v > 28672) {
+        if (v > 2000000L) return 32767;
+        return (s16)(32767 - (s32)(16769025L / (v - 28672 + 4095)));
+    }
+    if (v < -28672) {
+        if (v < -2000000L) return -32767;
+        return (s16)-(32767 - (s32)(16769025L / (-v - 28672 + 4095)));
+    }
     return (s16)v;
 }
 
@@ -99,20 +130,26 @@ static void enc1(u8 *p, s16 v, u32 bits, u32 flt)
 
 static struct winring *ringp(struct astream *s)
 {
-    struct winring *r = (struct winring *)plat_sysrm(s->ring);
+    struct winring *r = s->direct ? s->direct : (struct winring *)plat_sysrm(s->ring);
     if (!r || r->magic != WINRING_MAGIC || !r->size) return NULL;
     return r;
 }
 
 /* ---------------------------------------------------------------- resampler */
 
-static void rs_init(struct rsmp *r, u32 in, u32 out)
+/* a new rate on the fly: the history stays */
+static void rs_rate(struct rsmp *r, u32 in, u32 out)
 {
     u32 ratio = (u32)(((u64)in * 100) / out);
-    memset(r, 0, sizeof(*r));
     r->pass = (u8)(in == out);
     r->step = (u32)(((u64)in << 16) / out);
     r->tab = src_tab[ratio <= 100 ? 0 : ratio <= 170 ? 1 : ratio <= 300 ? 2 : 3];
+}
+
+static void rs_init(struct rsmp *r, u32 in, u32 out)
+{
+    memset(r, 0, sizeof(*r));
+    rs_rate(r, in, out);
     r->frac = 0x10000UL;
 }
 
@@ -143,8 +180,8 @@ static int rs_run(struct rsmp *r, const s16 *in, int n, s16 *out, int max, int *
             l += (s32)r->h[j][0] * c[k];
             rr += (s32)r->h[j][1] * c[k];
         }
-        out[p * 2] = clip16(l >> 15);
-        out[p * 2 + 1] = clip16(rr >> 15);
+        out[p * 2] = hard16(l >> 15);
+        out[p * 2 + 1] = hard16(rr >> 15);
         p++;
         r->frac += r->step;
     }
@@ -153,7 +190,116 @@ done:
     return p;
 }
 
+/* Windows volumes are linear in amplitude (half way: -6 dB); hardware amplifiers count in dB
+   steps. The attenuation in 1/100 dB: 20 * log10(65535 / v), 0xFFFFFFFF for silence. */
+u32 aeng_att_cdb(u32 v)
+{
+    u32 x, l2 = 0, bit;
+    if (!v) return 0xFFFFFFFFUL;
+    if (v >= 65535) return 0;
+    x = (65535UL << 15) / v;                    /* Q15, >= 1.0 */
+    while (x >= 65536UL) {
+        x >>= 1;
+        l2 += 65536UL;
+    }
+    for (bit = 32768UL; bit; bit >>= 1) {
+        x = (x * x) >> 15;
+        if (x >= 65536UL) {
+            x >>= 1;
+            l2 |= bit;
+        }
+    }
+    return (u32)(((u64)l2 * 60206UL) >> 16) / 100;     /* 6.0206 dB per octave */
+}
+
 /* ---------------------------------------------------------------- devices */
+
+/* MX_* value for the hardware: the master is 0 while muted */
+static u32 hwval(struct adev *a, int ctl)
+{
+    return ctl == MX_MASTER && a->mute ? 0 : a->vol[ctl];
+}
+
+/* ---- saved mixer settings: a record for each device seen (by a key from its name and ids),
+   given to the platform on every change (Windows 95/98/ME: the registry) and set by
+   WINF_AUD_VOLS (DOS: WINAUDIO.VOL at the start, Windows 95/98/ME: the registry) ---- */
+#define MAXVREC 16
+static struct winvolrec vrecs[MAXVREC];
+static int nvrec;
+
+static u32 vol_key(struct adev *a)
+{
+    return crc32(((u32)a->vid << 16) | a->pid, a->name, strlen(a->name));
+}
+
+static struct winvolrec *vrec_find(u32 key)
+{
+    int i;
+    for (i = 0; i < nvrec; i++)
+        if (vrecs[i].key == key) return &vrecs[i];
+    return NULL;
+}
+
+/* the saved settings of a, if there are any, become its settings (the hardware not touched) */
+static int vrec_apply(struct adev *a)
+{
+    struct winvolrec *r = vrec_find(vol_key(a));
+    int j;
+    if (!r) return 0;
+    for (j = 0; j < MX_COUNT; j++) a->vol[j] = r->vol[j];
+    a->mute = r->mute != 0;
+    if (r->insrc & a->insrcs) a->insrc = r->insrc;
+    return 1;
+}
+
+/* a's settings changed: its record, and the platform is told */
+static void vrec_store(struct adev *a)
+{
+    u32 key = vol_key(a);
+    struct winvolrec *r = vrec_find(key);
+    int j;
+    if (!r) {
+        if (nvrec == MAXVREC) {
+            for (j = 1; j < MAXVREC; j++) vrecs[j - 1] = vrecs[j];     /* the oldest goes */
+            nvrec--;
+        }
+        r = &vrecs[nvrec++];
+    }
+    memset(r, 0, sizeof(*r));
+    r->key = key;
+    for (j = 0; j < MX_COUNT; j++) r->vol[j] = a->vol[j];
+    r->mute = a->mute;
+    r->insrc = a->insrc;
+    plat_vol_saved(vrecs, (u32)nvrec * sizeof(vrecs[0]));
+}
+
+static void hw_settings(struct adev *a)
+{
+    int j;
+    if (a->ops->set_vol && !a->gone)
+        for (j = 0; j < MX_COUNT; j++)
+            if (j != MX_MASTER || a->hwvol) a->ops->set_vol(a, j, hwval(a, j));
+    if (a->insrc && a->ops->set_src && !a->gone) a->ops->set_src(a, a->insrc);
+}
+
+static int api_vols(struct winapireq *rq, u8 *buf)
+{
+    int i, n;
+    if (rq->arg0 == 0) {
+        n = (int)MIN((u32)nvrec, rq->buflen / sizeof(vrecs[0]));
+        if (n && buf) memcpy(buf, vrecs, (u32)n * sizeof(vrecs[0]));
+        rq->retlen = (u32)n * sizeof(vrecs[0]);
+        return WINE_OK;
+    }
+    if (!buf) return WINE_BADFN;
+    n = (int)MIN(rq->buflen / sizeof(vrecs[0]), (u32)MAXVREC);
+    memcpy(vrecs, buf, (u32)n * sizeof(vrecs[0]));
+    nvrec = n;
+    for (i = 0; i < MAXADEV; i++)
+        if (adevs[i] && !adevs[i]->hidden && vrec_apply(adevs[i])) hw_settings(adevs[i]);
+    rq->retlen = 0;
+    return WINE_OK;
+}
 
 int adev_register(struct adev *a)
 {
@@ -164,7 +310,7 @@ int adev_register(struct adev *a)
             a->out.running = a->in.running = 0;
             if (a->ops->set_vol)
                 for (j = 0; j < MX_COUNT; j++)
-                    if (j != MX_MASTER || a->hwvol) a->ops->set_vol(a, j, a->vol[j]);
+                    if (j != MX_MASTER || a->hwvol) a->ops->set_vol(a, j, hwval(a, j));
             if (a->insrc && a->ops->set_src) a->ops->set_src(a, a->insrc);
             kprintf("audio %d: %s is back\n", i, a->name);
             return i;
@@ -178,10 +324,12 @@ int adev_register(struct adev *a)
         a->vol[MX_WAVE] = 0xFFFFFFFFUL;
         a->vol[MX_SYNTH] = 0xFFFFFFFFUL;
         a->vol[MX_LINE] = 0;                    /* line-in pass-through off */
+        if (vrec_apply(a)) kprintf("audio %d: saved mixer settings\n", i);
+        if (a->ops->set_src && a->insrc) a->ops->set_src(a, a->insrc);
         if (a->caps & WINAC_OUT) a->caps |= WINAC_SYNTH;
         if (a->ops->set_vol)
             for (j = 0; j < MX_COUNT; j++)
-                if (j != MX_MASTER || a->hwvol) a->ops->set_vol(a, j, a->vol[j]);
+                if (j != MX_MASTER || a->hwvol) a->ops->set_vol(a, j, hwval(a, j));
         kprintf("audio %d: %s%s%s\n", i, a->name, (a->caps & WINAC_OUT) ? ", playback" : "",
                 (a->caps & WINAC_IN) ? ", recording" : "");
         return i;
@@ -233,7 +381,7 @@ void aeng_flush_dma(void *p, u32 n)
 static int peek(struct astream *s, struct winring *r, s16 *dst, int n)
 {
     u32 avail = (r->wr - r->rd) / s->fsz, off, i, bs = s->bits / 8;
-    u8 *d = (u8 *)r + 32;
+    u8 *d = s->data ? s->data : (u8 *)r + 32;
     if ((u32)n > avail) n = (int)avail;
     off = r->rd % r->size;
     for (i = 0; i < (u32)n; i++) {
@@ -247,11 +395,36 @@ static int peek(struct astream *s, struct winring *r, s16 *dst, int n)
     return n;
 }
 
+/* DirectSound's primary buffer: what the engine took becomes silence, so that a part the
+   mixer has not written again in time plays as a gap rather than as the sound of one turn of
+   the buffer ago */
+static void ds_taken(struct astream *s, struct winring *r, u32 n)
+{
+    u32 off = r->rd % r->size, k;
+    while (n) {
+        k = MIN(n, r->size - off);
+        memset(s->data + off, s->bits == 8 ? 0x80 : 0, k);
+        n -= k;
+        off = 0;
+    }
+}
+
 static void render(struct adev *a, struct astream *s, struct winring *r, int frames, u32 fill)
 {
-    u32 wl = a->vol[MX_WAVE] & 0xFFFF, wr = a->vol[MX_WAVE] >> 16;
+    u32 wl = a->vol[s->volctl] & 0xFFFF, wr = a->vol[s->volctl] >> 16;
     s32 gl = (s32)(((u64)s->vl * (wl + 1)) >> 16), gr = (s32)(((u64)s->vr * (wr + 1)) >> 16);
     int got = 0;
+    if (s->ds == DS_PRIMARY || s->loop) {
+        /* always full, like the DMA buffer of a card; the counters stay far from wrapping
+           (the offsets in the buffer are counter % size) */
+        if (r->rd >= 0x40000000UL) {
+            u32 k = (r->pos < r->rd ? r->pos : r->rd);
+            k -= k % r->size;
+            r->rd -= k;
+            r->pos -= k;
+        }
+        r->wr = r->rd + r->size;
+    }
     while (got < frames) {
         int want = MIN(frames - got, CHUNK * 4);
         int need = s->rs.pass ? want : (int)(((u64)want * s->rs.step) >> 16) + 2;
@@ -259,6 +432,7 @@ static void render(struct adev *a, struct astream *s, struct winring *r, int fra
         if (need > MAXIN) need = MAXIN;
         nin = peek(s, r, tin, need);
         prod = rs_run(&s->rs, tin, nin, tout, want, &used);
+        if (s->ds == DS_PRIMARY) ds_taken(s, r, (u32)used * s->fsz);
         r->rd += (u32)used * s->fsz;
         for (i = 0; i < prod; i++) {
             acc[(got + i) * 2] += (tout[i * 2] * gl) >> 16;
@@ -267,7 +441,7 @@ static void render(struct adev *a, struct astream *s, struct winring *r, int fra
         got += prod;
         if (prod) s->lastfill = fill + (u32)got * 4;
         if (!prod && !used) {
-            if (r->wr == r->rd && s->lastfill) r->flags |= RF_UNDERRUN;
+            if (r->wr == r->rd && s->lastfill && !s->rt) r->flags |= RF_UNDERRUN;
             break;
         }
     }
@@ -276,7 +450,7 @@ static void render(struct adev *a, struct astream *s, struct winring *r, int fra
 static void mix(struct adev *a, s16 *dst, int frames, u32 fill)
 {
     int i, live = 0;
-    u32 ml = a->vol[MX_MASTER] & 0xFFFF, mr = a->vol[MX_MASTER] >> 16;
+    u32 ml = hwval(a, MX_MASTER) & 0xFFFF, mr = hwval(a, MX_MASTER) >> 16;
     memset(acc, 0, (u32)frames * 8);
     for (i = 0; i < MAXSTREAM; i++) {
         struct astream *s = &streams[i];
@@ -318,7 +492,7 @@ static u32 latency_bytes(struct ahw *h)
 {
     /* the VxD services every 10 ms, the DOS core every timer tick (55 ms, and polls can
        be skipped while DOS is busy) */
-    u32 ms = plat_mode == PM_VXD ? 70 : 400;
+    u32 ms = h->latms ? h->latms : (plat_mode == PM_VXD ? 70 : lowlat ? 40 : 400) + h->adapt;
     u32 b = (h->rate / 1000 * ms) * 4;
     if (b > h->size - h->period) b = h->size - h->period;
     return b & ~3UL;
@@ -333,13 +507,59 @@ static u32 stream_limit(struct adev *a)
         struct astream *s = &streams[i];
         struct winring *r;
         u32 in, outf;
-        if (!s->used || !s->running || s->dir || s->dev != a->index || !(r = ringp(s))) continue;
+        if (!s->used || !s->running || s->dir || s->dev != a->index || s->rt || s->ds || !(r = ringp(s))) continue;
         in = (r->wr - r->rd) / s->fsz;
         outf = s->rs.pass ? in : (u32)(((u64)in << 16) / s->rs.step);
         outf = outf > 2 ? outf - 2 : 0;
         if (outf < lim) lim = outf;
     }
     return lim;
+}
+
+/* Silence after the written data: when the service comes late (DOS busy with the disk,
+   interrupts off for long) the device plays silence there, not the sound of one ring turn
+   ago (which is heard as a loop) */
+static void zero_ahead(struct ahw *h)
+{
+    u32 guard = h->size / 2, end, from;
+    if ((s32)(h->zeroed - h->fill) < 0) h->zeroed = h->fill;
+    if (h->fill - h->hwtotal + guard + h->period > h->size) guard = h->size - (h->fill - h->hwtotal) - h->period;
+    if ((s32)guard <= 0) return;
+    end = h->fill + guard;
+    from = h->zeroed;
+    while ((s32)(end - from) > 0) {
+        u32 off = from % h->size, n = end - from;
+        if (n > h->size - off) n = h->size - off;
+        memset(h->buf + off, 0, n);
+        if (!h->noflush) aeng_flush_dma(h->buf + off, n);
+        from += n;
+    }
+    h->zeroed = end;
+}
+
+/* The real-time streams (Sound Blaster, FM) are produced as fast as the device plays: when
+   the mixing goes further ahead, they get that much silence once, or they would run dry at
+   every gap of their producer from then on */
+static void rt_pad(struct adev *a, u32 ms)
+{
+    int i;
+    for (i = 0; i < MAXSTREAM; i++) {
+        struct astream *s = &streams[i];
+        struct winring *r;
+        u32 n, off;
+        if (!s->used || !s->rt || s->dev != a->index || !(r = ringp(s))) continue;
+        n = s->rate * ms / 1000 * s->fsz;
+        if (n > r->size - (r->wr - r->rd)) n = r->size - (r->wr - r->rd);
+        n -= n % s->fsz;
+        while (n) {
+            u32 k;
+            off = r->wr % r->size;
+            k = r->size - off < n ? r->size - off : n;
+            memset((u8 *)r + 32 + off, 0, k);
+            r->wr += k;
+            n -= k;
+        }
+    }
 }
 
 static void out_service(struct adev *a)
@@ -355,8 +575,19 @@ static void out_service(struct adev *a)
     if ((s32)(h->fill - h->hwtotal) < 0) {                          /* we were late */
         if (!h->late++ || !(h->late & 63))
             kprintf("audio %d: playback ran dry %lu time(s) (%lu bytes)\n", a->index, h->late, h->hwtotal - h->fill);
-        h->fill = h->hwtotal;
+        /* mix further ahead from now on: controllers that fetch far ahead of what they play
+           (the AC'97 and HD Audio of virtual machines take tens of ms at once) */
+        if (h->adapt < 200) {
+            h->adapt += 20;
+            rt_pad(a, 20);
+            kprintf("audio %d: latency %lu ms\n", a->index, latency_bytes(h) / 4 * 1000 / h->rate);
+        }
+        /* resume a little ahead: the controller has already fetched the bytes at its position */
+        h->fill = h->hwtotal + ((h->rate / 1000 * 4) * 4 & ~3UL);
     }
+#ifdef WIN_AUDIO
+    if (a->index == rt_dev && sb_active()) sb_produce(d / 4, h->rate);
+#endif
     /* as far ahead as the streams have data, up to the latency; never less than the safety
        margin (then a starving stream gets a gap of silence instead of stale sound) */
     target = h->hwtotal + latency_bytes(h);
@@ -376,6 +607,7 @@ static void out_service(struct adev *a)
         if (!h->noflush) aeng_flush_dma(h->buf + off, n);
         h->fill += n;
     }
+    zero_ahead(h);
     out_positions(a);
 }
 
@@ -454,7 +686,11 @@ static void hw_start(struct adev *a, int dir)
     memset(h->buf, 0, h->size);
     if (!h->noflush) aeng_flush_dma(h->buf, h->size);
     h->fill = h->hwtotal = h->lastpos = 0;
-    if (!dir) h->fill = h->period;  /* playback starts on a period of silence */
+    /* playback starts on silence that outlasts the first service (and the controller's prefetch) */
+    if (!dir) {
+        u32 lead = latency_bytes(h);
+        h->fill = h->zeroed = lead > h->period ? lead : h->period;
+    }
     for (i = 0; i < MAXSTREAM; i++)
         if (streams[i].dev == a->index) streams[i].lastfill = 0;
     if (a->ops->start(a, dir) == 0) h->running = 1;
@@ -474,7 +710,8 @@ static void idle_stop(struct adev *a, int dir)
     struct ahw *h = dir ? &a->in : &a->out;
     int busy;
     if (!h->running) return;
-    busy = dev_busy(a, dir) || (!dir && a->index == synth_dev && synth_busy());
+    busy = dev_busy(a, dir) || (!dir && a->index == synth_dev && synth_busy()) ||
+           (!dir && a->index == rt_dev && SB_ON());
     if (busy) {
         h->idle = 0;
         return;
@@ -483,14 +720,27 @@ static void idle_stop(struct adev *a, int dir)
     else if (plat_ms() - h->idle > 2000) hw_stop(a, dir);
 }
 
+#ifdef WIN_AUDIO
+static void br_poll(void);
+#else
+static void brc_poll(void);
+static void brc_close(void);
+#endif
+
 void aeng_poll(void)
 {
     int i;
+#ifdef WIN_AUDIO
+    br_poll();
+#else
+    brc_poll();
+#endif
     for (i = 0; i < MAXADEV; i++) {
         struct adev *a = adevs[i];
         if (!a || a->gone) continue;
         if (a->ops->poll) a->ops->poll(a);
         if (a->index == synth_dev && synth_busy() && !a->out.running) hw_start(a, 0);
+        if (a->index == rt_dev && SB_ON() && !a->out.running) hw_start(a, 0);
         out_service(a);
         in_service(a);
         idle_stop(a, 0);
@@ -507,6 +757,13 @@ void aeng_init(void)
 void aeng_shutdown(void)
 {
     int i;
+#ifdef WIN_AUDIO
+    sb_stop();
+#else
+    brc_close();
+    ((struct winbridge *)((u8 *)cb + WIN_BROFF))->state = 0;
+    ((struct winbridge *)((u8 *)cb + WIN_BROFF))->outs = 0;
+#endif
     for (i = 0; i < MAXADEV; i++) {
         struct adev *a = adevs[i];
         if (!a) continue;
@@ -531,6 +788,574 @@ void aeng_remove(struct adev *a)
             return;
         }
 }
+
+/* ---------------------------------------------------------------- internal streams */
+
+/* the device the synthesizer and the emulated Sound Blaster play on */
+static int default_dev(void)
+{
+    int d, pass;
+    if (synth_dev >= 0 && adevs[synth_dev] && !adevs[synth_dev]->gone) return synth_dev;
+    /* a sound device of this driver first; the bridge to WINUSB's USB Audio when there is
+       none, or first with /USBSB */
+    for (pass = 0; pass < 2; pass++)
+        for (d = 0; d < MAXADEV; d++)
+            if (adevs[d] && !adevs[d]->gone && (adevs[d]->caps & WINAC_SYNTH) &&
+                (pass || adevs[d]->hidden == ((cb->opts2 & OPT2_USBSB) != 0)))
+                return d;
+    return -1;
+}
+
+void aeng_midi(const u8 *m, int len)
+{
+    int d = default_dev();
+    struct adev *a;
+    if (d < 0) return;
+    a = adevs[d];
+    if (synth_dev != d) {
+        if (synth_dev >= 0) synth_reset();
+        synth_dev = d;
+    }
+    synth_midi(m, len);
+    if (!a->out.running) hw_start(a, 0);
+}
+
+void aeng_lowlat(int on)
+{
+    lowlat = (u8)on;
+}
+
+/* a 16-bit stereo stream in a ring of the core, produced in real time */
+int aeng_rt_open(struct winring *r, u32 rate, int volctl)
+{
+    int i, d = default_dev();
+    struct astream *s;
+    if (d < 0) return -1;
+    for (i = 0; i < MAXSTREAM; i++)
+        if (!streams[i].used) break;
+    if (i == MAXSTREAM) return -1;
+    s = &streams[i];
+    memset(s, 0, sizeof(*s));
+    s->direct = r;
+    s->rt = 1;
+    s->dev = (u8)d;
+    s->rate = rate;
+    s->bits = 16;
+    s->ch = 2;
+    s->fsz = 4;
+    s->vl = s->vr = 0x10000UL;
+    s->volctl = (u8)volctl;
+    rs_init(&s->rs, rate, adevs[d]->out.rate);
+    s->used = 1;
+    rt_dev = d;
+    return i;
+}
+
+static struct astream *rt_get(int id)
+{
+    if (id < 0 || id >= MAXSTREAM || !streams[id].used || !streams[id].direct) return NULL;
+    return &streams[id];
+}
+
+/* running: silence first, as much as the device plays before the producer has had its
+   first period, plus a cushion against the jitter of the service times */
+void aeng_rt_run(int id, int run)
+{
+    struct astream *s = rt_get(id);
+    struct adev *a;
+    struct winring *r;
+    u32 lead, want, n, cushion;
+    if (!s) return;
+    a = adev_get(s->dev);
+    s->running = (u8)run;
+    if (!run || !a || a->gone) return;
+    if (!a->out.running) hw_start(a, 0);
+    r = s->direct;
+    lead = a->out.fill - a->out.hwtotal;
+    want = latency_bytes(&a->out);
+    cushion = plat_mode == PM_VXD ? 25 : lowlat ? 15 : 120;
+    n = want > lead ? (want - lead) / 4 : 0;
+    n = (u32)(((u64)n * s->rate) / a->out.rate) + s->rate * cushion / 1000;
+    if (n * 4 > r->size / 2) n = r->size / 8;
+    memset((u8 *)r + 32, 0, r->size);
+    r->rd = 0;
+    r->wr = r->pos = n * 4;
+    rs_init(&s->rs, s->rate, a->out.rate);
+}
+
+void aeng_rt_rate(int id, u32 rate)
+{
+    struct astream *s = rt_get(id);
+    struct adev *a;
+    if (!s || s->rate == rate) return;
+    a = adev_get(s->dev);
+    s->rate = rate;
+    if (a) rs_init(&s->rs, rate, a->out.rate);
+}
+
+void aeng_rt_vol(int id, u32 vl, u32 vr)
+{
+    struct astream *s = rt_get(id);
+    if (!s) return;
+    s->vl = vl;
+    s->vr = vr;
+}
+
+void aeng_rt_close(int id)
+{
+    struct astream *s = rt_get(id);
+    if (s) memset(s, 0, sizeof(*s));
+}
+
+/* ---------------------------------------------------------------- DirectSound
+
+   The buffers of the DirectSound HAL (Windows 95/98/ME, dsvxd.c). The primary buffer loops:
+   DirectSound's kernel mixer fills it ahead of the write cursor while the engine plays it
+   round and round, as a card plays its DMA buffer. The secondary buffers are mixed by the
+   engine like the wave streams, each at its own rate, volume and pan; one plays once from
+   where it stands to its end, or round and round. The play cursor is what is heard now,
+   the write cursor what the engine has taken. */
+
+static struct astream *ds_get(int id)
+{
+    if (id < 0 || id >= MAXSTREAM || !streams[id].used || !streams[id].ds) return NULL;
+    return &streams[id];
+}
+
+int aeng_ds_format(int id, u32 rate, u32 bits, u32 ch)
+{
+    struct astream *s = ds_get(id);
+    struct adev *a;
+    if (!s || !(a = adev_get(s->dev)) || a->gone) return -1;
+    if ((bits != 8 && bits != 16) || (ch != 1 && ch != 2) || rate < 100 || rate > 192000) return -1;
+    if (s->direct->size % (bits / 8 * ch)) return -1;
+    s->rate = rate;
+    s->bits = bits;
+    s->ch = ch;
+    s->fsz = bits / 8 * ch;
+    rs_init(&s->rs, rate, a->out.rate);
+    return 0;
+}
+
+/* r: the header of the buffer's counters (r->size its bytes), data: the buffer */
+int aeng_ds_open(int dev, struct winring *r, u8 *data, u32 rate, u32 bits, u32 ch, int secondary)
+{
+    struct adev *a = adev_get(dev);
+    struct astream *s;
+    int i;
+    if (!a || a->gone || !(a->caps & WINAC_OUT) || !r || !data || r->magic != WINRING_MAGIC || !r->size) return -1;
+    for (i = 0; i < MAXSTREAM; i++)
+        if (!streams[i].used) break;
+    if (i == MAXSTREAM) return -1;
+    s = &streams[i];
+    memset(s, 0, sizeof(*s));
+    s->direct = r;
+    s->data = data;
+    s->ds = (u8)(secondary ? DS_SECONDARY : DS_PRIMARY);
+    s->dev = (u8)dev;
+    s->vl = s->vr = 0x10000UL;
+    s->volctl = MX_WAVE;
+    s->used = 1;
+    if (aeng_ds_format(i, rate, bits, ch)) {
+        memset(s, 0, sizeof(*s));
+        return -1;
+    }
+    r->rd = r->wr = r->pos = 0;
+    if (!secondary) kprintf("audio %d: DirectSound primary buffer, %lu bytes\n", dev, r->size);
+    return i;
+}
+
+/* streams free for more buffers */
+int aeng_ds_free(void)
+{
+    int i, n = 0;
+    for (i = 0; i < MAXSTREAM; i++) n += !streams[i].used;
+    return n;
+}
+
+static void ds_start(struct astream *s, struct adev *a)
+{
+    s->lastfill = 0;
+    rs_init(&s->rs, s->rate, a->out.rate);
+    s->running = 1;
+    if (!a->out.running) hw_start(a, 0);
+}
+
+/* the primary buffer */
+void aeng_ds_run(int id, int run)
+{
+    struct astream *s = ds_get(id);
+    struct adev *a;
+    if (!s) return;
+    a = adev_get(s->dev);
+    if (!run || !a || a->gone) {
+        s->running = 0;
+        return;
+    }
+    if (s->running) return;
+    s->direct->pos = s->direct->rd;
+    ds_start(s, a);
+}
+
+/* a secondary buffer that played once to its end */
+static int ds_done(struct astream *s)
+{
+    return !s->loop && s->direct->pos >= s->direct->size;
+}
+
+/* a secondary buffer plays from where it stands (again from the start after its end);
+   one playing already only takes the new looping */
+void aeng_ds_play(int id, int loop)
+{
+    struct astream *s = ds_get(id);
+    struct winring *r;
+    struct adev *a;
+    u32 off;
+    if (!s || s->ds != DS_SECONDARY || !(a = adev_get(s->dev)) || a->gone) return;
+    r = s->direct;
+    if (s->running && !ds_done(s)) {
+        if (!loop && s->loop) {
+            /* to its end from this turn on: the counters back to the offsets of this turn */
+            u32 k = r->rd - r->rd % r->size;
+            r->rd -= k;
+            r->pos = r->pos >= k ? r->pos - k : 0;
+            r->wr = r->size;
+        }
+        s->loop = (u8)(loop != 0);
+        return;
+    }
+    off = s->running ? 0 : s->dspos;
+    if (off >= r->size) off = 0;
+    s->loop = (u8)(loop != 0);
+    r->rd = r->pos = off;
+    r->wr = s->loop ? off + r->size : r->size;
+    ds_start(s, a);
+}
+
+/* stopped where it is heard (at the start after its end) */
+void aeng_ds_stop(int id)
+{
+    struct astream *s = ds_get(id);
+    if (!s || s->ds != DS_SECONDARY) return;
+    if (s->running) s->dspos = ds_done(s) ? 0 : s->direct->pos % s->direct->size;
+    s->running = 0;
+}
+
+void aeng_ds_setpos(int id, u32 off)
+{
+    struct astream *s = ds_get(id);
+    struct winring *r;
+    if (!s || s->ds != DS_SECONDARY) return;
+    r = s->direct;
+    off -= off % s->fsz;
+    if (off >= r->size) off = 0;
+    s->dspos = off;
+    if (!s->running) return;
+    r->rd = r->pos = off;
+    r->wr = s->loop ? off + r->size : r->size;
+}
+
+void aeng_ds_rate(int id, u32 rate)
+{
+    struct astream *s = ds_get(id);
+    struct adev *a;
+    if (!s || !(a = adev_get(s->dev)) || s->rate == rate) return;
+    s->rate = rate;
+    rs_rate(&s->rs, rate, a->out.rate);
+}
+
+/* 0..65536 each */
+void aeng_ds_vol(int id, u32 vl, u32 vr)
+{
+    struct astream *s = ds_get(id);
+    if (!s) return;
+    s->vl = vl > 0x10000UL ? 0x10000UL : vl;
+    s->vr = vr > 0x10000UL ? 0x10000UL : vr;
+}
+
+/* the cursors, byte offsets in the buffer: without the engine's lock (DirectSound asks
+   often); a secondary buffer that played once to its end is at its size */
+void aeng_ds_pos(int id, u32 *play, u32 *write)
+{
+    struct astream *s = ds_get(id);
+    struct winring *r;
+    u32 rd, pos;
+    if (!s) {
+        *play = *write = 0;
+        return;
+    }
+    r = s->direct;
+    if (s->ds == DS_SECONDARY && !s->running) {
+        *play = *write = s->dspos;
+        return;
+    }
+    rd = r->rd;
+    pos = r->pos;
+    if ((s32)(rd - pos) < 0 || rd - pos >= r->size) pos = rd;
+    if (s->ds == DS_SECONDARY && !s->loop) {
+        *play = pos >= r->size ? r->size : pos;
+        *write = rd % r->size;
+        return;
+    }
+    *play = pos % r->size;
+    if (s->ds == DS_PRIMARY) {
+        /* the primary buffer: what DirectSound's mixer (or a program writing it) has written
+           ahead of the write cursor is only a few ms; the engine takes it in steps of its
+           service and more after a late service. A write cursor DS_GUARD ms further on keeps
+           those steps inside data that is written already. */
+        u32 g = s->rate * DS_GUARD / 1000 * s->fsz;
+        rd += g < r->size / 2 ? g : r->size / 2;
+    }
+    *write = rd % r->size;
+}
+
+void aeng_ds_close(int id)
+{
+    struct astream *s = ds_get(id);
+    if (s) memset(s, 0, sizeof(*s));
+}
+
+/* where an engine device is for the devnodes of Windows 95/98/ME: the controller's PCI
+   function (bus << 8 | device << 3 | function), HD Audio codec address + 1 << 16; a USB
+   device DSLOC_USB | its USB device id; 0xFFFF none (hidden, gone, no output) */
+u32 aeng_ds_loc(int dev)
+{
+    struct adev *a = adev_get(dev);
+    if (!a || a->gone || a->hidden || !(a->caps & WINAC_OUT)) return 0xFFFF;
+    if (a->usbid) return DSLOC_USB | a->usbid;
+    if (a->loc == 0xFFFF) return 0xFFFF;
+    return a->loc | ((u32)a->cad1 << 16);
+}
+
+/* DOS: the Sound Blaster emulation between timer polls (RTC) */
+void aeng_tick(void)
+{
+    struct adev *a = adev_get(rt_dev);
+    if (!a || a->gone || !SB_ON()) return;
+    if (!a->out.running) hw_start(a, 0);
+    out_service(a);
+}
+
+/* ---------------------------------------------------------------- sound bridge */
+
+/* WINAUDIO and WINUSB (struct winbridge in winapi.h): WINAUDIO's bridge device mixes the
+   Sound Blaster emulation and the synthesizer into a ring of its own memory, WINUSB plays
+   that ring on its first USB Audio output as a stream. The bridge device's position is the
+   consumer's read position while WINUSB serves the ring, else it follows the clock (the
+   emulated card keeps its pace with nobody listening). */
+#define BR_SIZE     65536UL
+#define BR_RATE     48000UL
+
+static struct winbridge *br_own(void)
+{
+    return (struct winbridge *)((u8 *)cb + WIN_BROFF);
+}
+
+static int br_peer_ok(struct winbridge *p)
+{
+    return p && p->magic == WINBR_MAGIC;
+}
+
+#ifdef WIN_AUDIO
+static struct adev br_dev;
+static struct winring *br_ring;
+static u32 br_vtot, br_us, br_frac, br_beat, br_beatms, br_probems;
+static s32 br_off;
+static u8 br_lock;
+static u8 br_up;
+
+static int br_start(struct adev *a, int dir)
+{
+    struct winbridge *o = br_own();
+    (void)a;
+    if (dir) return -1;
+    o->state = 0;
+    br_ring->rd = br_ring->wr = br_ring->pos = 0;
+    br_ring->flags = 0;
+    br_vtot = br_frac = 0;
+    br_lock = 0;
+    br_us = plat_us();
+    o->seq++;
+    o->state = 1;
+    return 0;
+}
+
+static void br_stop(struct adev *a, int dir)
+{
+    (void)a;
+    if (!dir) br_own()->state = 0;
+}
+
+static u32 br_pos(struct adev *a, int dir)
+{
+    struct winbridge *p = plat_bridge_peer();
+    u32 now = plat_ms(), us = plat_us(), rd = br_ring->rd, t, add, old;
+    int alive = 0;
+    (void)dir;
+    br_ring->wr = a->out.fill;              /* what has been mixed so far */
+    if (br_peer_ok(p)) {
+        if (p->beat != br_beat) {
+            br_beat = p->beat;
+            br_beatms = now;
+        }
+        alive = p->state && now - br_beatms < 250;
+    }
+    /* the clock moves the position smoothly (WINUSB takes the data in bursts, and the
+       emulated card's interrupts must not come in bursts); it follows WINUSB's reading */
+    t = us - br_us;
+    if (t > 1000000UL) t = 1000000UL;
+    t = t * (BR_RATE / 1000) * 4 + br_frac;
+    br_us = us;
+    add = (t / 1000) & ~3UL;
+    old = br_vtot;
+    br_vtot += add;
+    br_frac = t - add * 1000;
+    /* drift: the distance to what the USB device has played (the stream position WINUSB
+       keeps in the ring) stays as it was when the device began, within 2 % of the rate */
+    if (alive && br_ring->pos) {
+        s32 e = (s32)(br_ring->pos - br_vtot);
+        if (!br_lock) {
+            br_off = e;
+            br_lock = 1;
+        } else {
+            s32 c = (e - br_off) / 64, lim = (s32)(add / 50) + 4;
+            if (c > lim) c = lim;
+            if (c < -lim) c = -lim;
+            br_vtot += (u32)c & ~3UL;
+        }
+    }
+    /* never past what WINUSB has read: the mixing ahead would overwrite unread data */
+    if (alive && (s32)(br_vtot - rd) > 0) br_vtot = (s32)(old - rd) > 0 ? old : rd;
+    return br_vtot % BR_SIZE;
+}
+
+static void br_shutdown(struct adev *a)
+{
+    (void)a;
+    br_own()->state = 0;
+    br_up = 0;
+}
+
+static struct adevops br_ops = { br_start, br_stop, br_pos, NULL, NULL, NULL, br_shutdown, NULL };
+
+/* registers the bridge device once WINUSB has a USB Audio output */
+void aeng_bridge_probe(void)
+{
+    struct winbridge *o = br_own(), *p;
+    if (br_up) return;
+    o->magic = WINBR_MAGIC;
+    plat_bridge_publish(o);
+    p = plat_bridge_peer();
+    if (!br_peer_ok(p) || !p->outs) return;
+    if (!br_ring && !(br_ring = kmalloc_align(BR_SIZE + 32, 4096))) return;
+    memset(br_ring, 0, BR_SIZE + 32);
+    br_ring->magic = WINRING_MAGIC;
+    br_ring->size = BR_SIZE;
+    o->state = 0;
+    o->phys = vphys(br_ring);
+    o->lin = (u32)br_ring;
+    o->size = BR_SIZE;
+    o->rate = BR_RATE;
+    memset(&br_dev, 0, sizeof(br_dev));
+    br_dev.ops = &br_ops;
+    br_dev.type = AT_USB;
+    br_dev.caps = WINAC_OUT;
+    br_dev.hidden = 1;
+    br_dev.irq = 0xFF;
+    br_dev.loc = 0xFFFF;
+    strlcpy(br_dev.name, "USB Audio of WINUSB (sound bridge)", sizeof(br_dev.name));
+    br_dev.out.buf = (u8 *)br_ring + 32;
+    br_dev.out.size = BR_SIZE;
+    br_dev.out.period = 4096;
+    br_dev.out.rate = BR_RATE;
+    br_dev.out.present = 1;
+    br_dev.out.noflush = 1;
+    /* ahead of what WINUSB schedules on the USB device (DOS 150 ms, VxD tens of ms) */
+    br_dev.out.latms = plat_mode == PM_VXD ? 150 : 300;
+    if (adev_register(&br_dev) < 0) return;
+    br_up = 1;
+}
+
+/* why the bridge is not there (DOS start message), NULL when it is */
+const char *aeng_bridge_why(void)
+{
+    struct winbridge *p;
+    if (br_up) return NULL;
+    p = plat_bridge_peer();
+    if (!br_peer_ok(p)) return "WINUSB.SYS is not loaded before WINAUDIO.SYS";
+    if (!(((struct wincb *)((u8 *)p - WIN_BROFF))->opts & OPT_USB)) return "WINUSB.SYS runs without /USB (USB in DOS)";
+    if (!p->outs) return "WINUSB has found no USB Audio output";
+    return "not started";
+}
+
+static void br_poll(void)
+{
+    u32 now = plat_ms();
+    if (br_up || now - br_probems < 1000) return;
+    br_probems = now;
+    aeng_bridge_probe();
+}
+#else
+/* WINUSB: plays the ring of WINAUDIO's bridge device */
+static int brc_sid = -1;
+static u16 brc_seq;
+static u8 brc_dev;
+
+static void brc_close(void)
+{
+    if (brc_sid >= 0) streams[brc_sid].used = 0;
+    brc_sid = -1;
+}
+
+static void brc_poll(void)
+{
+    struct winbridge *o = br_own(), *p;
+    struct winring *r;
+    struct astream *s;
+    int i, n = 0, d = -1;
+    o->magic = WINBR_MAGIC;
+    plat_bridge_publish(o);
+    for (i = 0; i < MAXADEV; i++)
+        if (adevs[i] && !adevs[i]->gone && (adevs[i]->caps & WINAC_OUT)) {
+            n++;
+            if (d < 0) d = i;
+        }
+    o->outs = (u8)n;
+    p = plat_bridge_peer();
+    if (!br_peer_ok(p) || p->state != 1 || d < 0) {
+        brc_close();
+        o->state = 0;
+        return;
+    }
+    if (brc_sid >= 0 && (p->seq != brc_seq || brc_dev != d)) brc_close();
+    if (brc_sid < 0) {
+        r = plat_bridge_ring(p);
+        if (!r || r->magic != WINRING_MAGIC || r->size != p->size) return;
+        for (i = 0; i < MAXSTREAM && streams[i].used; i++) ;
+        if (i == MAXSTREAM) return;
+        s = &streams[i];
+        memset(s, 0, sizeof(*s));
+        s->direct = r;
+        s->dev = (u8)d;
+        s->rate = p->rate;
+        s->bits = 16;
+        s->ch = 2;
+        s->fsz = 4;
+        s->vl = s->vr = 0x10000UL;
+        s->volctl = MX_WAVE;
+        rs_init(&s->rs, p->rate, adevs[d]->out.rate);
+        s->used = 1;
+        s->running = 1;
+        hw_start(adevs[d], 0);
+        brc_sid = i;
+        brc_seq = p->seq;
+        brc_dev = (u8)d;
+        kprintf("audio %d: plays the sound bridge of WINAUDIO\n", d);
+    }
+    o->state = 1;
+    o->beat++;
+}
+#endif
 
 /* ---------------------------------------------------------------- API */
 
@@ -564,6 +1389,7 @@ static int api_open(struct winapireq *rq)
     r = ringp(s);
     if (!r || r->size % s->fsz) return WINE_BADFN;
     s->vl = s->vr = 0x10000UL;
+    s->volctl = MX_WAVE;
     if (dir) rs_init(&s->rs, a->in.rate, rate);
     else rs_init(&s->rs, rate, a->out.rate);
     s->used = 1;
@@ -580,7 +1406,7 @@ static int api_ctl(struct winapireq *rq)
     struct adev *a;
     struct winring *r;
     u32 n = rq->arg0;
-    if (!n || n > MAXSTREAM || !streams[n - 1].used) return WINE_BADFN;
+    if (!n || n > MAXSTREAM || !streams[n - 1].used || streams[n - 1].direct) return WINE_BADFN;
     s = &streams[n - 1];
     a = adev_get(s->dev);
     r = ringp(s);
@@ -628,14 +1454,25 @@ static int api_mix(struct winapireq *rq)
         if (set && (rq->arg2 & a->insrcs)) {
             a->insrc = (u8)rq->arg2;
             if (a->ops->set_src) a->ops->set_src(a, (int)rq->arg2);
+            vrec_store(a);
         }
         rq->retlen = a->insrc;
+        return WINE_OK;
+    }
+    if (ctl == MX_MUTE) {
+        if (set) {
+            a->mute = rq->arg2 != 0;
+            if (a->ops->set_vol && !a->gone) a->ops->set_vol(a, MX_MASTER, hwval(a, MX_MASTER));
+            vrec_store(a);
+        }
+        rq->retlen = a->mute;
         return WINE_OK;
     }
     if (ctl >= MX_COUNT) return WINE_BADFN;
     if (set) {
         a->vol[ctl] = rq->arg2;
-        if (a->ops->set_vol && !a->gone) a->ops->set_vol(a, (int)ctl, rq->arg2);
+        if (a->ops->set_vol && !a->gone) a->ops->set_vol(a, (int)ctl, hwval(a, (int)ctl));
+        vrec_store(a);
     }
     rq->retlen = a->vol[ctl];
     return WINE_OK;
@@ -650,7 +1487,7 @@ int aeng_api(struct winapireq *rq, u8 *buf)
         struct winauddev *d = (struct winauddev *)buf;
         for (i = 0; i < MAXADEV; i++) {
             struct adev *a = adevs[i];
-            if (!a) continue;
+            if (!a || a->hidden) continue;
             if ((u32)(n + 1) * sizeof(*d) > rq->buflen) break;
             memset(d, 0, sizeof(*d));
             d->id = (u8)i;
@@ -676,6 +1513,8 @@ int aeng_api(struct winapireq *rq, u8 *buf)
         return api_ctl(rq);
     case WINF_AUD_MIX:
         return api_mix(rq);
+    case WINF_AUD_VOLS:
+        return api_vols(rq, buf);
     case WINF_AUD_MIDI:
     {
         int d = (int)(rq->arg0 & 0xFF);
@@ -689,7 +1528,8 @@ int aeng_api(struct winapireq *rq, u8 *buf)
             m[2] = (u8)(rq->arg1 >> 16);
             p = m;
             len = 3;
-            if (m[0] < 0x80 || (m[0] & 0xF0) == 0xC0 || (m[0] & 0xF0) == 0xD0) len = 2;
+            if (m[0] < 0x80 || (m[0] & 0xF0) == 0xC0 || (m[0] & 0xF0) == 0xD0 || m[0] == 0xF1 || m[0] == 0xF3) len = 2;
+            else if (m[0] >= 0xF4 && m[0] != 0xF2) len = 1;         /* system common and real time */
         }
         if (d == 0xFF) {                        /* the synthesizer on the default device */
             for (d = 0; d < MAXADEV; d++)

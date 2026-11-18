@@ -1,24 +1,24 @@
 
   1. JAIUSB - USB driver for DOS under Jemm
 
-   JAIUSB is a fork of WinUSB, created as a JLM for Jemm. All Windows-specific
-  things of WinUSB are removed. 
-  
+   JAIUSB is a fork of WinUSB (https://github.com/???/WinUSB), created
+  as a JLM for Jemm. All Windows-specific things of WinUSB are removed.
 
 
   2. Usage
 
-   USB support for mass storage should be disabled in the BIOS. If the
-  so-called "legacy support" is disabled and an USB keyboard is attached,
+   If USB support for mass storage is enabled in the BIOS, JAIUSB will
+  take over the drive letters of the USB disks mounted by the BIOS. If the
+  so-called "legacy support" is disabled and no PS/2 keyboard is attached,
   be aware that you won't be able to navigate in a GRUB or MS-DOS boot menu,
-  since JAIUSB isn't loaded yet.
+  since USB keyboards will work only after JAIUSB has been loaded.
 
    The driver consists of 2 parts that must be loaded in CONFIG.SYS:
 
   DEVICE=JLOAD.EXE JAIUCORE.DLL
   DEVICE=JAIUSB.SYS [Options]
 
-  The lines must be placed behind the line that load Jemm386/JemmEx.
+  The lines must be placed behind the line that loads Jemm386/JemmEx.
 
 
   3. Options for JAIUSB.SYS
@@ -65,9 +65,9 @@
    Tool h2incX is to be found in the tools directory. It translates file
   winapi.h to winapi.inc, hence it's only needed if file winapi.h has been
   changed.
-   Source file jlm/jlment.asm needs file JLM.INC, which is part of Jemm.
 
 
   5. License
 
-   It's GPL v3, same as WINUSB.
+   It's GPL v3, same as WinUSB.
+
