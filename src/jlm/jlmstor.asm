@@ -21,11 +21,12 @@ _DATA ends
 	option casemap:none
 	.386
 
-;--- these 4 settings must match those in jlment.asm!
+;--- these 5 settings must match those in jlment.asm!
 KQV86    equ 0	;1=process kbd queue in v86-mode (irq 1/12 handler)
 POLLV86  equ 0	;1=poll in v86-mode, 0=poll in PL0
 IRQV86   equ 0	;1=handle USB interrupts in v86-mode
 INT15V86 equ 1	;1=handle int 15h, ah=C2h in v86-mode, 0=not impl yet!
+I13BIOSV86 equ 0	;1=take over disks mounted by BIOS
 
 WINAWARE equ 0	;1=check Win3/Win9x startup/exit and support int 33h
 WIN30    equ 0	;1=support for Win 3.0 DOSX
@@ -34,8 +35,6 @@ WIN30    equ 0	;1=support for Win 3.0 DOSX
 DEFERRED equ 0	;1=defer IRQs if status is unsafe
 TPMODE   equ 0	;1=support touchpad mode for irq 12
 PROTI13  equ 0	;1=protect int 13h
-
-I13BIOS  equ 1	;1=take over disks mounted by BIOS
 
 ifdef PKG_USB
 WIN_USB equ <>	;needed by winapi.inc
@@ -1540,53 +1539,39 @@ print proc
 print endp
 
 ifndef PKG_AUDIO
- if I13BIOS
 
 	.code _RDATA
 
 old13s   dd 0
+ if I13BIOSV86
 wbm      winbiosmap <>
 i13req   winapireq <>
-i13stat  db 8 dup (0)
-i13lba   dd 0, 0
-i13left  dw 0
-i13wr    db 0
-i13k     db 0
-
-I13FR struct
-	org -36
-rDi  dw ?,? ;-36
-rSi  dw ?,? ;-32
-rBp  dw ?,? ;-28
-     dw ?,?
-rBx  dw ?,? ;-20
-union
-rDx  dw ?,? ;-16
-struct
-rDl  db ?
-rDh  db ?
-ends
-ends
-union
-rCx  dw ?,? ;-12
-rCl_ db ?   ;-12
-ends
-union
-rAx  dw ?,? ;-8
-struct
-rAl  db ?   ;-8
-rAh  db ?   ;-7
-ends
-ends
-rEs  dw ?   ;-4
-rDs  dw ?   ;-2
-rOldBp dw ? ;+0
-rIp    dw ? ;+2
-rCs    dw ? ;+4
-rFlags dw ? ;+6
-I13FR ends
-
+i13stat  db 8 dup (0)   ;last status, returned by int13, ah=
+ else
+i13entry dd 0
+ endif
+ 
 	.code
+
+ ife I13BIOSV86
+
+int13s proc
+        cmp dl, 80h
+        jb .pass
+        cmp dl, 88h
+        jae .pass
+        push bx
+        movzx bx, dl
+        and bl,7Fh
+        bt word ptr [cs:cb.kbcstat], bx
+        pop bx
+        jc .ours
+.pass:  jmp [cs:old13s]
+.ours:
+        jmp [cs:i13entry]
+int13s endp
+
+ else
 
 int13s proc
         cmp dl, 80h
@@ -1599,15 +1584,46 @@ int13s proc
         pop bx
         jne .ours
 .pass:  jmp [cs:old13s]
-        ; frame: [bp+2] IP [bp+4] CS [bp+6] flags, [bp-2] DS [bp-4] ES, PUSHAD below:
-        ; EAX bp-8 (AL bp-8, AH bp-7), ECX bp-12, EDX bp-16, EBX bp-20, ESI bp-32, EDI bp-36
-.ours:  push bp
-        mov bp, sp
-        push ds
-        push es
+
+; BP frame
+
+I13FR struct
+	org -14
+lpBuffer dd ?
+lba      dd ?,?
+SecsLeft dw ?
+rDi    dw ?,?
+rSi    dw ?,?
+rBp    dw ?,?
+       dw ?,?
+rBx    dw ?,?
+union
+rDx    dw ?,?
+struct
+rDl    db ?
+rDh    db ?
+ends
+ends
+union
+rCx    dw ?,?
+rCl_   db ?
+ends
+union
+rAx    dw ?,?
+struct
+rAl    db ?
+rAh    db ?
+ends
+ends
+rIp    dw ?
+rCs    dw ?
+rFlags dw ?
+I13FR ends
+
+.ours:
         pushad
+        mov bp,sp
         sti
-        mov [cs:i13k], dl
         movzx si, dl
         sub si, 80h                     ; SI = k
         cmp ah, 02h
@@ -1636,6 +1652,8 @@ int13s proc
         loop .f
         mov al, 01h                     ; invalid function
         jmp .err_
+
+;--- AH=01: return last status
 .status:
         mov al, [cs:i13stat+si]
         test al, al
@@ -1648,19 +1666,19 @@ int13s proc
         test al, al
         jz .ret
         or  [bp].I13FR.rFlags, 1
-.ret:   popad
-        pop es
-        pop ds
-        pop bp
+.ret:
+        mov sp,bp
+        popad
         iret
 
-        ; CHS: AL sectors, CH cylinder low, CL bits 7-6 cylinder high and 5-0 sector, DH head
-.chs:   mov [cs:i13wr], 0
-        cmp ah, 03h
-        jne .chs1
-        mov [cs:i13wr], 1
-.chs1:  movzx ax, al
-        mov [cs:i13left], ax
+;--- AH=02/03
+;--- in: AL sectors
+;---     CH cylinder low
+;---     CL bits 7-6 cylinder high, 5-0 sector
+;---     DH head
+.chs:
+        movzx ax, al
+        push ax                         ; [bp].SecsLeft
         mov di, si
         shl di, 2
         movzx eax, cl
@@ -1678,43 +1696,59 @@ int13s proc
         jz .badsec
         dec ebx
         add eax, ebx
-        mov [cs:i13lba+0], eax
-        mov [cs:i13lba+4], 0
-        mov es, [bp].I13FR.rEs
-        mov di, [bp].I13FR.rBx
+        pushd 0                         ;[bp].lba high
+        push eax                        ;[bp].lba low
+        push es
+        push [bp].I13FR.rBx             ;[bp].lpBuffer
         call i13xfer
+        jc .err_
         mov [bp].I13FR.rAl, cl          ; AL=sectors read/write
-        mov al, ah
-        jmp .err_
+        jmp .ok
 .badsec:
         mov al, 04h
         jmp .err_
 
-        ; extended: DS:SI packet (count word +2, buffer +4, LBA qword +8)
-.ext:   mov [cs:i13wr], 0
-        cmp ah, 43h
-        jne .ext1
-        mov [cs:i13wr], 1
-.ext1:  mov ds, [bp].I13FR.rDs
+DAP struct
+bSize       db ?    ;+0 size of structure
+bRes        db ?    ;+1 reserved
+wNumSec     dw ?    ;+2 sectors to transfer
+dwBuffer    dd ?    ;+4 transfer buffer SSSS:OOOO (or -1)
+union
+dqStartSec  dq ?    ;+8
+struct
+dwStartLow  dd ?    ;+8 start sector low
+dwStartHigh dd ?    ;+12 start sector high
+ends
+ends
+;dqAddr     dq ?    ;+16 EDD 3.0: 64bit flat transfer buffer address if dwBuffer is FFFF:FFFF
+DAP ends
+
+;--- AH=42h/43h
+;--- in: DS:SI -> packet
+
+.ext:
         mov bx, [bp].I13FR.rSi
-        cmp dword ptr [bx+4], 0FFFFFFFFh    ; 64-bit flat buffer: not supported
+        cmp [bx].DAP.dwBuffer, -1            ; 64-bit flat buffer: not supported
         je .inval
-        mov ax, [bx+2]
-        mov [cs:i13left], ax
-        mov eax, [bx+8]
-        mov [cs:i13lba], eax
-        mov eax, [bx+12]
-        mov [cs:i13lba+4], eax
-        les di, [bx+4]
+        push [bx].DAP.wNumSec                ;[bp].SecsLeft
+        push [bx].DAP.dwStartHigh            ;[bp].lba high
+        push [bx].DAP.dwStartLow             ;[bp].lba low
+        push [bx].DAP.dwBuffer               ;[bp].lpBuffer
         call i13xfer
-        mov ds, [bp].I13FR.rDs
-        mov [bx+2], cx
-        mov al, ah
-        jmp .err_
+        jc .err_
+        mov [bx].DAP.wNumSec, cx
+        jmp .ok
 .inval: mov al, 01h
         jmp .err_
 
-        ; the BIOS geometry recorded at the start (AH=08h)
+;--- AH=08h
+;--- the BIOS geometry recorded at the start
+;--- out: CL= 0-5: max sector#; 6-7: max cyl# [8-9]
+;---      CH= max cyl# bits [0-7]
+;---      DL= #drives
+;---      DH= max head#
+;---      BL= drive type (0-6 floppies); floppies only?
+
 .geom:  mov di, si
         shl di, 2
         mov cx, [cs:cb.biosgeom+di].cyls  ; cylinders
@@ -1728,9 +1762,13 @@ int13s proc
         dec dh
         mov dl, [cs:cb.nbios]
         mov [bp].I13FR.rDx, dx
-        mov byte ptr [bp].I13FR.rBx, 0    ; BL
+;        mov byte ptr [bp].I13FR.rBx, 0    ; BL?
         mov [bp].I13FR.rAl, 0
         jmp .ok
+
+;--- AH=15h
+;--- out: AH=disk type
+;---      CX:DX=sectors
 
 .type_: mov di, si
         shl di, 2
@@ -1743,35 +1781,64 @@ int13s proc
         and [bp].I13FR.rFlags, not 1
         jmp .ret
 
-.edd:   cmp [bp].I13FR.rBx, 55AAh
+;--- AH=41h
+;--- BX=55AAh
+;--- out:
+;--- AH=major version of extension
+;--- CX=API bitmap support subset
+;---  b0: 42h-44h
+;---  b1: removable functions (45h/46h)
+;---  b2: EDD (48h,4Eh)
+
+.edd:   cmp bx, 55AAh
         jne .inval
         mov [bp].I13FR.rBx, 0AA55h
-        mov [bp].I13FR.rCx, 0001h         ; CX: packet functions
+        mov [bp].I13FR.rCx, 1 or 4        ; 42,43,48
         mov [cs:i13stat+si], 0
         mov [bp].I13FR.rAh, 21h           ; AH: EDD 1.1
         and [bp].I13FR.rFlags, not 1
         jmp .ret
 
+EDD struct ;v1.0
+wSize	dw ?	;+0
+wFlags	dw ?	;+2
+dwCyl	dd ?	;+4
+dwHeads	dd ?	;+8
+dwSecs	dd ?	;+12
+dwNSecsL dd ?	;+16
+dwNSecsH dd ?	;+20
+wSecSiz	dw ?	;+24
+EDD ends
+
+EDDF_DMATP      equ 000001b  ; DMA handled transparently
+EDDF_GEOMVALID  equ 000010b
+EDDF_REMOVABLE  equ 000100b
+EDDF_VERIFY     equ 001000b
+EDDF_CHANGELINE equ 010000b  ; if bit 2=1
+EDDF_LOCKABLE   equ 100000b  ; if bit 2=1
+
+;--- AH=48h
+;--- in: DS:SI -> EDD
+
 .params:
-        mov ds, [bp].I13FR.rDs
-        mov bx, [bp].I13FR.rSi            ; DS:SI result buffer
-        cmp word ptr [bx], 26
+        mov bx, [bp].I13FR.rSi
+        cmp [bx].EDD.wSize, sizeof EDD
         jb .inval
-        mov word ptr [bx], 26
-        mov word ptr [bx+2], 0
+        mov [bx].EDD.wSize, sizeof EDD
+        mov [bx].EDD.wFlags, EDDF_GEOMVALID or EDDF_REMOVABLE
         mov di, si
         shl di, 2
         movzx eax, [cs:cb.biosgeom+di].cyls
-        mov [bx+4], eax
+        mov [bx].EDD.dwCyl, eax
         movzx eax, [cs:cb.biosgeom+di].heads
-        mov [bx+8], eax
+        mov [bx].EDD.dwHeads, eax
         movzx eax, [cs:cb.biosgeom+di].spt
-        mov [bx+12], eax
+        mov [bx].EDD.dwSecs, eax
         mov eax, [cs:wbm.sectors+di]
-        mov [bx+16], eax
+        mov [bx].EDD.dwNSecsL, eax
         mov eax, [cs:wbm.sectorshi+di]
-        mov [bx+20], eax
-        mov word ptr [bx+24], 512
+        mov [bx].EDD.dwNSecsH, eax
+        mov [bx].EDD.wSecSiz, 512
         jmp .ok
 int13s endp
 
@@ -1782,102 +1849,95 @@ okfns_n  equ $ - okfns
 
 	.code
 
-; transfer i13left sectors at i13lba to/from ES:DI (disk of BIOS drive i13k):
-; AH = 0 or a BIOS error code, CX = sectors done
+; transfer [bp].SecsLeft sectors at [bp].lba to/from [bp].lpBuffer;
+; out: NC = ok, then CX = sectors
+;       C = error, then AL = error code
+; DS, BX and SI must be preserved
 i13xfer proc
-        push ebx
-        push edx
-        push edi
-        push es
+        push bx
         xor cx, cx
-.lp:    cmp [cs:i13left], 0
+.lp:    cmp [bp].I13FR.SecsLeft, 0
         je .done
-        ; normalize ES:DI (the core reads at most 64K - 16 at a time)
-        mov ax, di
+        ; normalize [bp].lpBuffer (the core reads at most 64K - 16 at a time)
+        mov ax, word ptr [bp].I13FR.lpBuffer+0
+        mov dx, word ptr [bp].I13FR.lpBuffer+2
+        mov bx, ax
         shr ax, 4
-        mov bx, es
-        add bx, ax
-        mov es, bx
-        and di, 0Fh
-        movzx bx, [cs:i13k]
+        add dx, ax
+        shl edx, 16
+        and bx, 0Fh
+        mov dx, bx
+        movzx bx, [bp].I13FR.rDl
         movzx eax, [cs:wbm.disk+bx-80h]
         dec eax
-        cmp [cs:i13wr], 0
+        test [bp].I13FR.rAh, 1   ;02/03/42/43
         je .rd
         or eax, 80000000h
 .rd:    mov [cs:i13req.fn], WINF_RAWIO
         mov [cs:i13req.status], 0FFFFh
         mov [cs:i13req.arg0], eax
-        mov eax, [cs:i13lba+0]
+        mov eax, [bp].I13FR.lba+0
         mov [cs:i13req.arg1], eax
-        mov eax, [cs:i13lba+4]
+        mov eax, [bp].I13FR.lba+4
         mov [cs:i13req.arg2], eax
-        movzx eax, [cs:i13left]
+        movzx eax, [bp].I13FR.SecsLeft
         cmp eax, 127
         jbe .n
         mov eax, 127
 .n:     shl eax, 9
         mov [cs:i13req.buflen], eax 
         mov [cs:i13req.retlen], 0
-        mov ax, es
-        shl eax, 16
-        mov ax, di
-        mov [cs:i13req.buf], eax        ; buf seg:off
-        call i13api
+        mov [cs:i13req.buf], edx        ; buf seg:off
+
+; the request i13req to the core: the DOS core, or the VxD while Windows runs
+
+        mov ebx, offset i13req
+  if WINAWARE
+        test word [cs:cb+CB_FLAGS], CBF_VXD
+        jz .core
+        mov ax, 1
+        call [cs:cb.vxd_entry]
+        jmp .calldone
+  endif        
+.core:  mov ax, cs
+        movzx eax, ax
+        shl eax, 4
+        add ebx, eax
+        mov ax, FN_API
+        call callcore
+.calldone:
         cmp [cs:i13req.status], 0
         jne .ioerr
         mov eax, [cs:i13req.retlen]     ; bytes done
         shr eax, 9
         jz .ioerr
         add cx, ax
-        sub [cs:i13left], ax
-        add [cs:i13lba+0], eax
-        adc [cs:i13lba+4], 0
+        sub [bp].I13FR.SecsLeft, ax
+        add [bp].I13FR.lba+0, eax
+        adc [bp].I13FR.lba+4, 0
         shl ax, 5                       ; paragraphs
-        mov bx, es
-        add bx, ax
-        mov es, bx
+        add word ptr [bp].I13FR.lpBuffer+2, ax
         jmp .lp
-.done:  xor ah, ah
-        jmp .x
-.ioerr: mov ah, 04h                     ; sector not found / read error
-        cmp [cs:i13wr], 0
+.ioerr:
+        mov al,0AAh                     ; disk not ready
+        cmp byte ptr cs:[i13req.status], WINE_NODEV
+        jz .x
+        mov al, 04h                     ; sector not found / read error
+        test [bp].I13FR.rAh, 1          ; read or write?
         je .x
-        mov ah, 0CCh                    ; write fault
-.x:     pop es
-        pop edi
-        pop edx
-        pop ebx
+        mov al, 0CCh                    ; write fault
+.x:
+        stc
+.done:
+        pop bx
         ret
 i13xfer endp
 
-; the request i13req to the core: the DOS core, or the VxD while Windows runs
-i13api proc
-        push eax
-        push ebx
-        mov bx, offset i13req
-if WINAWARE
-        test word [cs:cb+CB_FLAGS], CBF_VXD
-        jz .core
-        mov ax, 1
-        call [cs:cb+CB_VXDENTRY]
-        jmp .x
-endif        
-.core:  mov ax, cs
-        movzx eax, ax
-        shl eax, 4
-        movzx ebx, bx
-        add ebx, eax
-        mov ax, FN_API
-        call callcore
-.x:
-        pop eax
-        pop ebx
-        ret
-i13api endp
-
+ endif
+ 
 	.code _ITEXT
 
+ if I13BIOSV86
 ;--- get BIOS map;
 ;--- this code runs after the core init call
 ;--- the BIOS disks on controllers the core took over: their INT 13h is served here
@@ -1904,12 +1964,11 @@ get_biosmap proc
         inc si
         cmp si, 8
         jb .ci
-        jmp .noi13
-.hki13: mov al, 13h
-        mov di, offset old13s
-        mov dx, offset int13s
-        call hook
 .noi13:
+        clc
+        ret
+.hki13:
+        stc
         ret
 get_biosmap endp
 
@@ -2119,9 +2178,20 @@ ifndef PKG_USB
 endif
 
 ifndef PKG_AUDIO
- if I13BIOS
+ if I13BIOSV86
         call get_biosmap
+        jnc @F
+ else
+        cmp cb.kbcstat, 0       ;kbcstat abused for int13 flags
+        jz @F
+        mov eax, cb.vxd_entry   ;vxd_entry abused for int13 callback
+        mov i13entry, eax
  endif
+        mov al, 13h
+        mov di, offset old13s
+        mov dx, offset int13s
+        call hook
+@@:        
 endif
 
         ; DOS-mode? (always true) 
@@ -2828,20 +2898,17 @@ read_bios_mbrs proc
 .none:  ret
 read_bios_mbrs endp
 
-geom_drv db 0
-
-; DL = BIOS drive: INT 13h AH=08h geometry into cb.biosgeom (for the FastDisk of the VxD)
+; DL = disk, 80h - max. 87h
+; INT 13h AH=08h geometry into cb.biosgeom (for the FastDisk of the VxD)
 bios_geom proc
         pusha
         push es
-        mov [cs:geom_drv], dl
+        push dx
         mov ah, 08h
         int 13h
+        pop bx
         jc .x
-        movzx bx, [cs:geom_drv]
-        sub bl, 80h
-        cmp bl, 8     ;# of entries in cb.biosgeom[]
-        jae .x
+        and bx, 7Fh
         shl bx, 2     ;4 = sizeof struct wingeom
         mov al, cl
         and al, 3Fh

@@ -445,7 +445,7 @@ static void syn_sector(struct winunit *u, u32 n, u8 *p)
     memset(p, 0, 512);
     if (n == 0) {
         p[0] = 0xEB; p[1] = 0x3C; p[2] = 0x90;
-        memcpy(p + 3, "WINDRV  ", 8);
+        memcpy(p + 3, "JAIDRV  ", 8);
         memcpy(p + 11, u->bpb, 25);
         p[38] = 0x29;
         *(u32 *)(p + 39) = u->serial;

@@ -42,7 +42,7 @@ void usb_pci_list(struct pcidev *l, int n);
    NVMe with /NVME): their INT 13h calls are served by the driver from now on, the BIOS code
    of those controllers no longer works (a USB boot disk would be lost: "Bad or missing ..."
    for every file DOS reads from it afterwards). A disk matches by its first sector, once. */
-static int api_biosmap(struct winbiosmap *m)
+int __cdecl api_biosmap(struct winbiosmap *m)
 {
     int i, k, hits, hit;
     u8 *buf;

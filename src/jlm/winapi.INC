@@ -1,5 +1,5 @@
 ;--- include file created by h2incx v1.0 (Public Domain, written by Andreas Grech)
-;--- source file: C:\PROJECTS\JAIUSB\SRC\INC\winapi.h, last modified: 11/18/2026 13:16
+;--- source file: C:\PROJECTS\JAIUSB\SRC\INC\winapi.h, last modified: 11/19/2026 10:43
 ;--- cmdline used for creation: -b -y -o src/jlm src/inc/winapi.h
 
 ifndef WINAPI_H

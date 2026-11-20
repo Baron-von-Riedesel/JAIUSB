@@ -1,17 +1,21 @@
 
-  1. JAIUSB - USB driver for DOS under Jemm
+  1. About JAIUSB
+  
+    JAIUSB is a USB driver for DOS, a fork of WinUSB. It needs Jemm386/JemmEx
+   to run, since it's a so-called Jemm Loadable Module (JLM). Compared to
+   WinUSB, there are the following benefits:
 
-   JAIUSB is a fork of WinUSB (https://github.com/???/WinUSB), created
-  as a JLM for Jemm. All Windows-specific things of WinUSB are removed.
+   - the driver runs in the memory context of Jemm, while WinUSB runs
+     as VCPI client in another context; memory context switching requires
+     CPU time.
+   - while waiting for a device, JAIUSB is able to callout to v86-mode;
+     no timer interrupts will get lost.
+   - DOS conventional memory usage is significantly reduced to about 2.5 kb.
+   - for JLM there exist a PL0 debugger, so JAIUSB can be easily debugged
+     in case of problems.
 
 
-  2. Usage
-
-   If USB support for mass storage is enabled in the BIOS, JAIUSB will
-  take over the drive letters of the USB disks mounted by the BIOS. If the
-  so-called "legacy support" is disabled and no PS/2 keyboard is attached,
-  be aware that you won't be able to navigate in a GRUB or MS-DOS boot menu,
-  since USB keyboards will work only after JAIUSB has been loaded.
+  2. Installation
 
    The driver consists of 2 parts that must be loaded in CONFIG.SYS:
 
@@ -21,20 +25,24 @@
   The lines must be placed behind the line that loads Jemm386/JemmEx.
 
 
-  3. Options for JAIUSB.SYS
+  3. Commandline Options for JAIUSB.SYS
 
-  /R:n      drive letters reserved for USB disks (16 at most, default 4)
-  /NOMSC    no mass storage
-  /NOHID    no keyboard / mouse
+  /R:n      drive letters reserved for USB disks (16 at most). If this
+            option isn't given, 2 drive letters are reserved, but may
+            increase if more disks are attached.
+  /NOMSC    disables mass storage support
+  /NOHID    no keyboard / mouse support
   /NOKBC    no 8042 injection in DOS
   /V        verbose
   /D        debug log on
   /COM1     log to COM1
   /S        the driver log is copied to the screen
   /POLL     no controller interrupts, polling only (for IRQ problems)
-  /NOPOLL   use controller interrupts, even if they're shared
+  /NOPOLL   use controller interrupts, even if they're shared. In this
+            mode JAIUSB will use less CPU resources; in rare cases there
+            might be problems with it.
   /NORELOC  do not move PCI resources from above 4 GB at boot
-  /ALL4G    move every device below 4 GB at boot
+  /ALL4G    move every PCI device below 4 GB at boot
   /NOXHCI   leave controllers of that kind to the BIOS
   /NOEHCI   leave controllers of that kind to the BIOS
   /NOOHCI   leave controllers of that kind to the BIOS
@@ -50,10 +58,31 @@
             (ExpressCard, PCIe slots)
   /NVME
   /NONVME   NVMe controllers behind tunnels: also take over the one the BIOS
-            started
+            started.
 
 
-  4. Creating the binaries
+  4. Hints
+
+   If USB support for mass storage is enabled in the BIOS, JAIUSB will
+  take over the drive letters of the USB disks mounted by the BIOS.
+  However, hot-plugin won't work for such disks.
+
+   If the so-called "legacy support" is disabled and no PS/2 keyboard is
+  attached, be aware that you won't be able to navigate in a GRUB or MS-DOS
+  boot menu, since USB keyboards will work only after JAIUSB has been loaded.
+
+   Partitions that DOS cannot handle ( NTFS, exFAT ) get a drive letter. DOS
+  will see them as a tiny FAT16 readonly disk, the label will tell the file
+  system.
+
+
+  5. JAIInfo
+
+   This tool displays JAIUSB's current status. It may also be used for a
+   "safe" removal of USB sticks. Run "jaiinfo -?" to see its options.
+
+
+  6. Creating the binaries
 
    The tools to create the binaries are:
 
@@ -67,7 +96,7 @@
   changed.
 
 
-  5. License
+  7. License
 
    It's GPL v3, same as WinUSB.
 

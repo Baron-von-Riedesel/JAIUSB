@@ -65,12 +65,14 @@ $(OUTD)\core.lib: $(COREOBJS)
 $(OUTD)\platjlm.obj: src\jlm\platjlm.c
 	@$(WATCOM)\binnt\wcc386 -bt=windows $(COPT) $(COPTD) -I$(JEMMINC) src\jlm\platjlm.c
 
-$(OUTD)\jlment.obj: src\jlm\jlment.asm
+$(OUTD)\jlment.obj: src\jlm\jlment.asm src\jlm\winapi.inc
 	@jwasm -q -I$(JEMMINC) -Fo$(OUTD)/jlment.obj src/jlm/jlment.asm
 
-$(OUTD)\$(NAME2): src\jlm\jlmstor.asm
-	@tools\h2incx.exe -b -y -o src/jlm src/inc/winapi.h
+$(OUTD)\$(NAME2): src\jlm\jlmstor.asm src\jlm\winapi.inc
 	@jwasm -q -mz -D?MZ -DJLM -DPKG_USB -Fl$(OUTD)/JAIUSB.lst -Fo$(OUTD)/JAIUSB.SYS src/jlm/jlmstor.asm
+
+src\jlm\winapi.inc: src\inc\winapi.h
+	@tools\h2incx.exe -b -y -o src/jlm src/inc/winapi.h
 
 $(OUTD)\Tools\$(NAME3): $(OUTD)\Tools\wininfo.obj $(OUTD)\tools\winfmt.obj $(OUTD)\tools\winfs.obj
 	@$(WATCOM)\binnt\wlink @<<

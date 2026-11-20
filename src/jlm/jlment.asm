@@ -13,11 +13,12 @@ DLL_PROCESS_DETACH equ 0
 
 DEVICE_ID equ 3D34h
 
-;--- these 4 settings must match those in jlmstor.asm
+;--- these settings must match those in jlmstor.asm
 KQV86     equ 0
 POLLV86   equ 0
 IRQV86    equ 0
 INT15V86  equ 1	;must be 1, 0 not impl.
+I13BIOSV86 equ 0;1=take over disks mounted by BIOS
 
 externdef c ent_init:near
 externdef c ent_dos:near
@@ -159,11 +160,374 @@ endif
 vecs IRQS IRQPM*8+IRQ0+IRQ1+IRQ12 dup (<>)
 endvecs equ $
 
-if IRQ0 or IRQ1 or IRQ12 or IRQPM
+if IRQ0 or IRQ1 or IRQ12 or IRQPM or I13BIOSV86
 cb  dd 0
 endif
 
+ife I13BIOSV86
+wbm      winbiosmap <>
+i13stat  db 8 dup (0)   ;last status, returned by int13, ah=
+endif
+
 	.code
+
+ife I13BIOSV86
+
+int13 proc uses ebx esi edi
+        @VMMCall Simulate_Iret
+        mov ah, byte ptr [ebp].Client_Reg_Struc.Client_EAX+1
+        movzx esi, byte ptr [ebp].Client_Reg_Struc.Client_EDX
+        and esi, 7Fh
+        cmp ah, 02h
+        je is_chs
+        cmp ah, 03h
+        je is_chs
+        cmp ah, 42h
+        je is_ext
+        cmp ah, 43h
+        je is_ext
+        cmp ah, 08h
+        je is_geom
+        cmp ah, 15h
+        je is_type
+        cmp ah, 41h
+        je is_edd
+        cmp ah, 48h
+        je is_params
+        cmp ah, 01h
+        je is_status
+        mov edi, offset okfns
+        mov ecx, okfns_n
+@@:     cmp ah, [edi]
+        je is_ok
+        inc edi
+        loop @B
+        mov al, 01h                     ; invalid function
+        jmp is_err
+
+;--- AH=01: return last status
+is_status:
+        mov al, [i13stat+esi]
+        test al, al
+        jnz is_err
+is_ok:  xor al, al
+is_err:  ; AL = status
+        mov [i13stat+esi], al
+        mov byte ptr [ebp].Client_Reg_Struc.Client_EAX+1, al
+        and [ebp].Client_Reg_Struc.Client_EFlags, not 1	; CF=0
+        test al, al
+        jz is_ret
+        or  [ebp].Client_Reg_Struc.Client_EFlags, 1
+is_ret:
+        ret
+
+;--- AH=02/03
+;--- in: AL sectors
+;---     CH cylinder low
+;---     CL bits 7-6 cylinder high, 5-0 sector
+;---     DH head
+is_chs:
+        movzx eax, byte ptr [ebp].Client_Reg_Struc.Client_EAX
+        push eax                         ; [esp].SecsLeft
+        mov edi, esi
+        shl edi, 2
+        mov eax, cb
+        lea edi, [edi+eax+wincb.biosgeom]
+        movzx eax, byte ptr [ebp].Client_Reg_Struc.Client_ECX
+        shl eax, 2
+        ; EAX = cylinder (bits 9-8 from CL 7-6)
+        mov al, byte ptr [ebp].Client_Reg_Struc.Client_ECX+1
+        and eax, 3FFh
+        movzx ebx, [edi].wingeom.heads
+        mul ebx                         ; * heads
+        movzx ebx, byte ptr [ebp].Client_Reg_Struc.Client_EDX+1
+        add eax, ebx
+        movzx ebx, [edi].wingeom.spt
+        mul ebx                         ; * sectors per track
+        movzx ebx, byte ptr [ebp].Client_Reg_Struc.Client_ECX
+        and bl, 3Fh
+        jz is_badsec
+        dec ebx
+        add eax, ebx
+        pushd 0                         ;[esp].lba high
+        push eax                        ;[esp].lba low
+        movzx eax, word ptr [ebp].Client_Reg_Struc.Client_ES
+        shl eax, 16
+        mov ax, word ptr [ebp].Client_Reg_Struc.Client_EBX
+        push eax                        ;[esp].lpBuffer
+        call i13xfer
+        jc is_err
+        mov byte ptr [ebp].Client_Reg_Struc.Client_EAX, cl     ; AL=sectors read/write
+        jmp is_ok
+is_badsec:
+        mov al, 04h
+        jmp is_err
+
+DAP struct
+bSize       db ?    ;+0 size of structure
+bRes        db ?    ;+1 reserved
+wNumSec     dw ?    ;+2 sectors to transfer
+dwBuffer    dd ?    ;+4 transfer buffer SSSS:OOOO (or -1)
+union
+dqStartSec  dq ?    ;+8
+struct
+dwStartLow  dd ?    ;+8 start sector low
+dwStartHigh dd ?    ;+12 start sector high
+ends
+ends
+;dqAddr     dq ?    ;+16 EDD 3.0: 64bit flat transfer buffer address if dwBuffer is FFFF:FFFF
+DAP ends
+
+;--- AH=42h/43h
+;--- in: DS:SI -> packet
+
+is_ext:
+        movzx ebx, word ptr [ebp].Client_Reg_Struc.Client_ESI
+        movzx eax, word ptr [ebp].Client_Reg_Struc.Client_DS
+        shl eax, 4
+        add ebx, eax
+        cmp [ebx].DAP.dwBuffer, -1           ; 64-bit flat buffer: not supported
+        je is_inval
+        movzx eax, [ebx].DAP.wNumSec
+        push eax                             ;[esp].SecsLeft
+        push [ebx].DAP.dwStartHigh           ;[esp].lba high
+        push [ebx].DAP.dwStartLow            ;[esp].lba low
+        push [ebx].DAP.dwBuffer              ;[esp].lpBuffer
+        call i13xfer
+        jc is_err
+        mov [ebx].DAP.wNumSec, cx
+        jmp is_ok
+is_inval: mov al, 01h
+        jmp is_err
+
+;--- AH=08h
+;--- the BIOS geometry recorded at the start
+;--- out: CL= 0-5: max sector#; 6-7: max cyl# [8-9]
+;---      CH= max cyl# bits [0-7]
+;---      DL= #drives
+;---      DH= max head#
+;---      BL= drive type (0-6 floppies); floppies only?
+
+is_geom:  mov edi, esi
+        shl edi, 2
+        mov eax, cb
+        lea edi, [edi+eax+wincb.biosgeom]
+        mov cx, [edi].wingeom.cyls  ; cylinders
+        dec cx
+        xchg cl, ch
+        ror cl, 2
+        and cl, 0C0h
+        or cl, [edi].wingeom.spt
+        mov word ptr [ebp].Client_Reg_Struc.Client_ECX, cx
+        mov dh, [edi].wingeom.heads
+        dec dh
+        mov dl, [eax].wincb.nbios
+        mov word ptr [ebp].Client_Reg_Struc.Client_EDX, dx
+        mov byte ptr [ebp].Client_Reg_Struc.Client_EAX, 0
+        jmp is_ok
+
+;--- AH=15h
+;--- out: AH=disk type
+;---      CX:DX=sectors
+
+is_type: mov edi, esi
+        shl edi, 2
+        mov ax, word ptr [wbm.sectors+edi+2]
+        mov word ptr [ebp].Client_Reg_Struc.Client_ECX, ax            ; CX:DX sectors
+        mov ax, word ptr [wbm.sectors+edi+0]
+        mov word ptr [ebp].Client_Reg_Struc.Client_EDX, ax
+        mov [i13stat+esi], 0
+        mov byte ptr [ebp].Client_Reg_Struc.Client_EAX+1, 03h         ; AH = 3: fixed disk
+        and [ebp].Client_Reg_Struc.Client_EFlags, not 1
+        jmp is_ret
+
+;--- AH=41h
+;--- BX=55AAh
+;--- out:
+;--- AH=major version of extension
+;--- CX=API bitmap support subset
+;---  b0: 42h-44h
+;---  b1: removable functions (45h/46h)
+;---  b2: EDD (48h,4Eh)
+
+is_edd:   
+        cmp word ptr [ebp].Client_Reg_Struc.Client_EBX, 55AAh
+        jne is_inval
+        mov word ptr [ebp].Client_Reg_Struc.Client_EBX, 0AA55h
+        mov word ptr [ebp].Client_Reg_Struc.Client_ECX, 1 or 4        ; 42,43,48
+        mov [i13stat+esi], 0
+        mov byte ptr [ebp].Client_Reg_Struc.Client_EAX+1, 21h         ; AH: EDD 1.1
+        and [ebp].Client_Reg_Struc.Client_EFlags, not 1
+        jmp is_ret
+
+EDD struct ;v1.0
+wSize	dw ?	;+0
+wFlags	dw ?	;+2
+dwCyl	dd ?	;+4
+dwHeads	dd ?	;+8
+dwSecs	dd ?	;+12
+dwNSecsL dd ?	;+16
+dwNSecsH dd ?	;+20
+wSecSiz	dw ?	;+24
+EDD ends
+
+EDDF_DMATP      equ 000001b  ; DMA handled transparently
+EDDF_GEOMVALID  equ 000010b
+EDDF_REMOVABLE  equ 000100b
+EDDF_VERIFY     equ 001000b
+EDDF_CHANGELINE equ 010000b  ; if bit 2=1
+EDDF_LOCKABLE   equ 100000b  ; if bit 2=1
+
+;--- AH=48h
+;--- in: DS:SI -> EDD
+
+is_params:
+        movzx ebx, word ptr [ebp].Client_Reg_Struc.Client_ESI
+        movzx eax, word ptr [ebp].Client_Reg_Struc.Client_DS
+        shl eax, 4
+        add ebx, eax
+        cmp [ebx].EDD.wSize, sizeof EDD
+        jb is_inval
+        mov [ebx].EDD.wSize, sizeof EDD
+        mov [ebx].EDD.wFlags, EDDF_GEOMVALID or EDDF_REMOVABLE
+        mov edi, esi
+        shl edi, 2
+        mov eax, cb
+        lea edi, [edi+eax+wincb.biosgeom]
+        movzx eax, [edi].wingeom.cyls
+        mov [ebx].EDD.dwCyl, eax
+        movzx eax, [edi].wingeom.heads
+        mov [ebx].EDD.dwHeads, eax
+        movzx eax, [edi].wingeom.spt
+        mov [ebx].EDD.dwSecs, eax
+        mov eax, [wbm.sectors+esi*4]
+        mov [ebx].EDD.dwNSecsL, eax
+        mov eax, [wbm.sectorshi+esi*4]
+        mov [ebx].EDD.dwNSecsH, eax
+        mov [ebx].EDD.wSecSiz, 512
+        jmp is_ok
+int13 endp
+
+	.data
+
+okfns    db 00h, 04h, 09h, 0Ch, 0Dh, 10h, 11h, 14h, 44h, 47h
+okfns_n  equ $ - okfns
+
+	.code
+
+; transfer [bp].SecsLeft sectors at [bp].lba to/from [bp].lpBuffer;
+; out: NC = ok, then CX = sectors
+;       C = error, then AL = error code
+; EBX and ESI must be preserved
+
+I13FR struc
+         dd ?    ;EBX
+i13req   winapireq <>
+         dd ?    ;return addr
+lpBuffer dd ?    ;real mode addr
+lba      dd ?,?
+SecsLeft dd ?
+I13FR ends
+
+i13xfer proc
+        sub esp, sizeof winapireq
+        push ebx
+        xor ecx, ecx
+is_lp:  cmp [esp].I13FR.SecsLeft, 0
+        je is_done
+        ; normalize [bp].lpBuffer (the core reads at most 64K - 16 at a time)
+        mov ax, word ptr [esp].I13FR.lpBuffer+0
+        mov dx, word ptr [esp].I13FR.lpBuffer+2
+        mov bx, ax
+        shr ax, 4
+        add dx, ax
+        shl edx, 16
+        and bx, 0Fh
+        mov dx, bx     ; EDX=normalized address
+
+        movzx ebx, byte ptr [ebp].Client_Reg_Struc.Client_EDX
+        and ebx, 7Fh
+        movzx eax, [wbm.disk+ebx]
+        dec eax
+        test [ebp].Client_Reg_Struc.Client_EAX+1, 1   ;02/03/42/43
+        je is_rd
+        or eax, 80000000h
+is_rd:  mov [esp].I13FR.i13req.fn, WINF_RAWIO
+        mov [esp].I13FR.i13req.status, 0FFFFh
+        mov [esp].I13FR.i13req.arg0, eax
+        mov eax, [esp].I13FR.lba+0
+        mov [esp].I13FR.i13req.arg1, eax
+        mov eax, [esp].I13FR.lba+4
+        mov [esp].I13FR.i13req.arg2, eax
+        mov eax, [esp].I13FR.SecsLeft
+        cmp eax, 127
+        jbe is_n
+        mov eax, 127
+is_n:   shl eax, 9
+        mov [esp].I13FR.i13req.buflen, eax 
+        mov [esp].I13FR.i13req.retlen, 0
+        mov [esp].I13FR.i13req.buf, edx        ; buf seg:off
+
+; the request i13req to the core: the DOS core, or the VxD while Windows runs
+
+        lea ebx, [esp].I13FR.i13req
+        push ebx
+        call ent_api
+        add esp, 4
+
+        cmp [esp].I13FR.i13req.status, 0
+        jne is_ioerr
+        mov eax, [esp].I13FR.i13req.retlen     ; bytes done
+        shr eax, 9
+        jz is_ioerr
+        add ecx, eax
+        sub [esp].I13FR.SecsLeft, eax
+        add [esp].I13FR.lba+0, eax
+        adc [esp].I13FR.lba+4, 0
+        shl ax, 5                       ; sectors -> paragraphs
+        add word ptr [esp].I13FR.lpBuffer+2, ax
+        jmp is_lp
+is_ioerr:
+        mov al,080h                     ; timeout (drive not ready)
+        cmp byte ptr [esp].I13FR.i13req.status, WINE_NODEV
+        jz is_x
+        mov al, 04h                     ; sector not found / read error
+        test [ebp].Client_Reg_Struc.Client_EAX+1, 1          ; read or write?
+        je is_x
+        mov al, 0CCh                    ; write fault
+is_x:
+        stc
+is_done:
+        pop ebx
+        lea esp, [esp+sizeof winapireq]
+        ret 4*4  ;skip lpBuffer, lba and SecsLeft
+i13xfer endp
+
+api_biosmap proto c :ptr
+
+get_biosmap proc uses esi
+        invoke api_biosmap, addr wbm
+        cmp eax, WINE_OK
+        jne is_nobm
+        xor esi, esi
+        xor al,al
+is_ci:  cmp [wbm.disk+esi], 0
+        je is_hki13
+        bts eax, esi
+is_hki13:
+        inc esi
+        cmp esi, 8
+        jb is_ci
+        and al, al
+        jz is_nobm
+        mov edx, cb
+        mov [edx].wincb.kbcstat, al     ;cb.kbcstat misused
+        ret
+is_nobm:
+        stc
+        ret
+get_biosmap endp
+endif
 
 if IRQPM
 
@@ -395,6 +759,19 @@ nextset:
 	add edi, sizeof IRQS
 	jmp nextset
 setdone:
+
+ife I13BIOSV86
+	call get_biosmap
+	jc @F
+	mov esi, offset int13
+	mov edx, 0
+	@VMMCall Allocate_V86_Call_Back
+	jc failed
+	mov edx, cb
+	mov [edx].wincb.vxd_entry, eax	  ;vxd_entry misused
+@@:
+endif
+
 	pop ebx
 	pop edi
 	pop esi

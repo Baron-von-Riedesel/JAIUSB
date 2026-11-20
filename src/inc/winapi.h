@@ -44,7 +44,7 @@
 #define US_WPROT    0x04
 #define US_EJECTED  0x08
 #define US_FOREIGN  0x10  /* v1.2: a file system DOS cannot mount: a small empty read-only volume */
-#define US_TAKEN    0x20  /* v1.2 */
+#define US_TAKEN    0x20  /* v1.2: */
 
 struct bpb_s {
     unsigned short bps;
@@ -70,9 +70,9 @@ struct extbpb_s {
     unsigned short bootbackup_sec;
 };
 
-struct winunit {                /* 64 bytes; japheth: added 28, so now 92; dos/winstor.asm must be adjusted */
-    unsigned char  type;
-    unsigned char  state;
+struct winunit {                /* 64 bytes; japheth: added 28 */
+    unsigned char  type;        /* UT_xxx */
+    unsigned char  state;       /* US_xxx */
     unsigned char  disk;        /* core disk index, 0xFF none */
     unsigned char  part;        /* partition number on disk */
     unsigned long  key;         /* disk identity */
@@ -325,13 +325,13 @@ struct core_params {
 
 struct winbiosmap {              /* WINF_BIOSMAP: BIOS disk 80h + k is our disk disk[k] - 1 */
     unsigned char  disk[8];
-    unsigned long  sectors[8];  /* 512-byte sectors (low 32 bits) */
+    unsigned long  sectors[8];   /* 512-byte sectors (low 32 bits) */
     unsigned long  sectorshi[8];
 };
 
 struct winapireq {               /* 32 bytes */
     unsigned short fn;
-    unsigned short status;
+    unsigned short status;       /* see WINE_ */
     unsigned long  arg0;
     unsigned long  arg1;
     unsigned long  arg2;
@@ -343,7 +343,7 @@ struct winapireq {               /* 32 bytes */
 
 /* ---- sound ---- */
 #define WINRING_MAGIC    0x47523357UL    /* 'WINRG' */
-struct winring {                 /* 32-byte header + data, in conventional memory */
+struct winring {                /* 32-byte header + data, in conventional memory */
     unsigned long  magic;
     unsigned long  size;        /* data bytes, multiple of the frame size */
     unsigned long  wr;          /* producer: total bytes written */

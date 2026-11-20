@@ -1,0 +1,11 @@
+
+  v1.1, 11.2026
+
+  - based on WinUSB v1.2
+  - conventional memory usage reduced to 2.5 kB.
+  - disks mounted by the BIOS are adopted.
+  - partitions that DOS cannot handle ( NTFS, exFAT ) will get a drive letter.
+
+  v1.0, 10.2026
+
+  - based on WinUSB v1.0
