@@ -16,6 +16,7 @@ OUTD=bjlm
 
 !ifdef DEBUG
 COPTD=-D_DEBUG
+AOPTD=-D_DEBUG -zf1 -Sg
 !endif
 
 COPT=-q -mf -zl -ox -wx -we -zp4 -ei -DJLM -DWIN_USB -DPKG_USB -Isrc\core -fo$(OUTD)\ -Isrc\inc 
@@ -65,14 +66,14 @@ $(OUTD)\core.lib: $(COREOBJS)
 $(OUTD)\platjlm.obj: src\jlm\platjlm.c
 	@$(WATCOM)\binnt\wcc386 -bt=windows $(COPT) $(COPTD) -I$(JEMMINC) src\jlm\platjlm.c
 
-$(OUTD)\jlment.obj: src\jlm\jlment.asm src\jlm\winapi.inc
-	@jwasm -q -I$(JEMMINC) -Fo$(OUTD)/jlment.obj src/jlm/jlment.asm
+$(OUTD)\jlment.obj: src\jlm\jlment.asm $(OUTD)\winapi.inc
+	@jwasm -q -I$(JEMMINC) $(AOPTD) -I$(OUTD) -Fl$* -Fo$* src/jlm/jlment.asm
 
-$(OUTD)\$(NAME2): src\jlm\jlmstor.asm src\jlm\winapi.inc
-	@jwasm -q -mz -D?MZ -DJLM -DPKG_USB -Fl$(OUTD)/JAIUSB.lst -Fo$(OUTD)/JAIUSB.SYS src/jlm/jlmstor.asm
+$(OUTD)\$(NAME2): src\jlm\jlmstor.asm $(OUTD)\winapi.inc
+	@jwasm -q -mz -D?MZ -DJLM -DPKG_USB $(AOPTD) -I$(OUTD) -Fl$(OUTD)/JAIUSB.lst -Fo$(OUTD)/JAIUSB.SYS src/jlm/jlmstor.asm
 
-src\jlm\winapi.inc: src\inc\winapi.h
-	@tools\h2incx.exe -b -y -o src/jlm src/inc/winapi.h
+$(OUTD)\winapi.inc: src\inc\winapi.h
+	@tools\h2incx.exe -b -y -o $(OUTD) src/inc/winapi.h
 
 $(OUTD)\Tools\$(NAME3): $(OUTD)\Tools\wininfo.obj $(OUTD)\tools\winfmt.obj $(OUTD)\tools\winfs.obj
 	@$(WATCOM)\binnt\wlink @<<
@@ -104,5 +105,6 @@ clean: .SYMBOLIC
 	@del $(OUTD)\$(NAME1)
 	@del $(OUTD)\core.lib
 	@del $(OUTD)\$(NAME2)
+	@del $(OUTD)\*.inc
 	@del $(OUTD)\tools\*.exe
 	@del $(OUTD)\tools\*.obj

@@ -13,12 +13,28 @@ DLL_PROCESS_DETACH equ 0
 
 DEVICE_ID equ 3D34h
 
+ifdef _DEBUG
+CStr macro text:vararg
+local sym
+	.const
+sym db text,0
+	.code
+	exitm <offset sym>
+endm
+kprintf proto fastcall :ptr, :vararg
+@dprintf equ <invoke kprintf, >
+else
+@dprintf equ <;>
+endif
+
 ;--- these settings must match those in jlmstor.asm
 KQV86     equ 0
 POLLV86   equ 0
 IRQV86    equ 0
 INT15V86  equ 1	;must be 1, 0 not impl.
-I13BIOSV86 equ 0;1=take over disks mounted by BIOS
+I13BIOSV86 equ 0;1=handle disks mounted by BIOS in v86
+
+DISKCHANGE equ 1
 
 externdef c ent_init:near
 externdef c ent_dos:near
@@ -166,15 +182,44 @@ endif
 
 ife I13BIOSV86
 wbm      winbiosmap <>
-i13stat  db 8 dup (0)   ;last status, returned by int13, ah=
+ if DISKCHANGE
+bStat db -1
+ endif
+i13stat  db WIN_MAXBIOSDISKS dup (0)   ;last status, returned by int13, ah=
 endif
 
 	.code
+
+if 1
+plat_disk_change proc c idx:dword, stat:byte
+	@dprintf CStr("plat_disk_change(idx=%d, stat=%u)",10), idx, stat
+	mov eax, idx
+	inc eax
+	mov ecx, WIN_MAXBIOSDISKS
+@@:
+	mov edx, offset wbm.disk
+	cmp al, [edx]
+	jz found
+	inc edx
+	loop @B
+	ret
+found:
+	sub edx, offset wbm.disk
+	cmp stat,0
+	jnz @F
+	btr dword ptr bStat, edx
+	ret
+@@:
+	bts dword ptr bStat, edx
+	ret
+plat_disk_change endp
+endif
 
 ife I13BIOSV86
 
 int13 proc uses ebx esi edi
         @VMMCall Simulate_Iret
+        @dprintf CStr("int13(ax=%X)",10), [ebp].Client_Reg_Struc.Client_EAX
         mov ah, byte ptr [ebp].Client_Reg_Struc.Client_EAX+1
         movzx esi, byte ptr [ebp].Client_Reg_Struc.Client_EDX
         and esi, 7Fh
@@ -190,6 +235,10 @@ int13 proc uses ebx esi edi
         je is_geom
         cmp ah, 15h
         je is_type
+if 0;DISKCHANGE
+        cmp ah, 16h
+        je is_querychange
+endif
         cmp ah, 41h
         je is_edd
         cmp ah, 48h
@@ -227,8 +276,6 @@ is_ret:
 ;---     CL bits 7-6 cylinder high, 5-0 sector
 ;---     DH head
 is_chs:
-        movzx eax, byte ptr [ebp].Client_Reg_Struc.Client_EAX
-        push eax                         ; [esp].SecsLeft
         mov edi, esi
         shl edi, 2
         mov eax, cb
@@ -249,6 +296,8 @@ is_chs:
         jz is_badsec
         dec ebx
         add eax, ebx
+        movzx ecx, byte ptr [ebp].Client_Reg_Struc.Client_EAX
+        push ecx                        ;[esp].SecsLeft
         pushd 0                         ;[esp].lba high
         push eax                        ;[esp].lba low
         movzx eax, word ptr [ebp].Client_Reg_Struc.Client_ES
@@ -293,6 +342,7 @@ is_ext:
         push [ebx].DAP.dwStartHigh           ;[esp].lba high
         push [ebx].DAP.dwStartLow            ;[esp].lba low
         push [ebx].DAP.dwBuffer              ;[esp].lpBuffer
+        @dprintf CStr("jlment: AH=42/43, disk=%u start=%u secs=%u buffer=%X",10), esi, [ebx].DAP.dwStartLow, eax, [ebx].DAP.dwBuffer
         call i13xfer
         jc is_err
         mov [ebx].DAP.wNumSec, cx
@@ -309,6 +359,7 @@ is_inval: mov al, 01h
 ;---      BL= drive type (0-6 floppies); floppies only?
 
 is_geom:  mov edi, esi
+        @dprintf CStr("jlment: AH=08, disk=%u",10), esi
         shl edi, 2
         mov eax, cb
         lea edi, [edi+eax+wincb.biosgeom]
@@ -333,13 +384,31 @@ is_geom:  mov edi, esi
 is_type: mov edi, esi
         shl edi, 2
         mov ax, word ptr [wbm.sectors+edi+2]
-        mov word ptr [ebp].Client_Reg_Struc.Client_ECX, ax            ; CX:DX sectors
+        mov word ptr [ebp].Client_Reg_Struc.Client_ECX, ax          ; CX:DX sectors
         mov ax, word ptr [wbm.sectors+edi+0]
         mov word ptr [ebp].Client_Reg_Struc.Client_EDX, ax
         mov [i13stat+esi], 0
-        mov byte ptr [ebp].Client_Reg_Struc.Client_EAX+1, 03h         ; AH = 3: fixed disk
+if 0;DISKCHANGE
+        mov byte ptr [ebp].Client_Reg_Struc.Client_EAX+1, 2         ; AH = 2: removable with change line support
+else
+        mov byte ptr [ebp].Client_Reg_Struc.Client_EAX+1, 3         ; AH = 3: fixed disk
+endif
         and [ebp].Client_Reg_Struc.Client_EFlags, not 1
         jmp is_ret
+
+if 0;DISKCHANGE
+
+;--- AH=16h
+;--- out: AH=0, NC : no change
+;---      AH=6, C : change
+
+is_querychange:
+        @dprintf CStr("jlment: AH=16h, disk=%u",10), esi
+        btr dword ptr bUnplugged, esi
+        mov al, 6
+        jc is_err
+        jmp is_ok
+endif
 
 ;--- AH=41h
 ;--- BX=55AAh
@@ -382,6 +451,7 @@ EDDF_LOCKABLE   equ 100000b  ; if bit 2=1
 ;--- in: DS:SI -> EDD
 
 is_params:
+        @dprintf CStr("jlment: AH=48h, disk=%u",10), esi
         movzx ebx, word ptr [ebp].Client_Reg_Struc.Client_ESI
         movzx eax, word ptr [ebp].Client_Reg_Struc.Client_DS
         shl eax, 4
@@ -432,6 +502,10 @@ I13FR ends
 i13xfer proc
         sub esp, sizeof winapireq
         push ebx
+if 1
+        bt dword ptr bStat, esi
+        jnc is_err
+endif
         xor ecx, ecx
 is_lp:  cmp [esp].I13FR.SecsLeft, 0
         je is_done
@@ -447,7 +521,7 @@ is_lp:  cmp [esp].I13FR.SecsLeft, 0
 
         movzx ebx, byte ptr [ebp].Client_Reg_Struc.Client_EDX
         and ebx, 7Fh
-        movzx eax, [wbm.disk+ebx]
+        movzx eax, [wbm.disk+ebx]  ; this is the 1-based index for disks[] in blk.c
         dec eax
         test [ebp].Client_Reg_Struc.Client_EAX+1, 1   ;02/03/42/43
         je is_rd
@@ -491,6 +565,7 @@ is_ioerr:
         mov al,080h                     ; timeout (drive not ready)
         cmp byte ptr [esp].I13FR.i13req.status, WINE_NODEV
         jz is_x
+is_err:        
         mov al, 04h                     ; sector not found / read error
         test [ebp].Client_Reg_Struc.Client_EAX+1, 1          ; read or write?
         je is_x
@@ -505,10 +580,14 @@ i13xfer endp
 
 api_biosmap proto c :ptr
 
+;--- get bios map and set cb.kbcstat
+
 get_biosmap proc uses esi
         invoke api_biosmap, addr wbm
         cmp eax, WINE_OK
         jne is_nobm
+        @dprintf CStr("get_biosmap: disks=%u %u %u %u %u %u %u %u",10), wbm.disk, wbm.disk+1, wbm.disk+2, wbm.disk+3,
+        	wbm.disk+4, wbm.disk+5, wbm.disk+6, wbm.disk+7
         xor esi, esi
         xor al,al
 is_ci:  cmp [wbm.disk+esi], 0
@@ -516,7 +595,7 @@ is_ci:  cmp [wbm.disk+esi], 0
         bts eax, esi
 is_hki13:
         inc esi
-        cmp esi, 8
+        cmp esi, WIN_MAXBIOSDISKS
         jb is_ci
         and al, al
         jz is_nobm

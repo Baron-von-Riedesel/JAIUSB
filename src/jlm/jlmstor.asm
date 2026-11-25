@@ -10,6 +10,10 @@ _TEXT segment para public 'CODE'  ; resident code
 _TEXT ends
 _RDATA segment para public 'CODE' ; resident data
 _RDATA ends
+ifdef _DEBUG
+_DStrings segment byte public 'CODE' ; resident debug strings
+_DStrings ends
+endif
 _ITEXT segment para public 'CODE' ; non-resident code
 resident_end label byte
 _ITEXT ends
@@ -26,7 +30,7 @@ KQV86    equ 0	;1=process kbd queue in v86-mode (irq 1/12 handler)
 POLLV86  equ 0	;1=poll in v86-mode, 0=poll in PL0
 IRQV86   equ 0	;1=handle USB interrupts in v86-mode
 INT15V86 equ 1	;1=handle int 15h, ah=C2h in v86-mode, 0=not impl yet!
-I13BIOSV86 equ 0	;1=take over disks mounted by BIOS
+I13BIOSV86 equ 0;1=take over disks mounted by BIOS
 
 WINAWARE equ 0	;1=check Win3/Win9x startup/exit and support int 33h
 WIN30    equ 0	;1=support for Win 3.0 DOSX
@@ -36,6 +40,9 @@ DEFERRED equ 0	;1=defer IRQs if status is unsafe
 TPMODE   equ 0	;1=support touchpad mode for irq 12
 PROTI13  equ 0	;1=protect int 13h
 
+MODDPB   equ 0	;1=modify device driver header in DPB for BIOS disks [untested]
+MODDDT   equ 0	;1=modify dos disk table
+
 ifdef PKG_USB
 WIN_USB equ <>	;needed by winapi.inc
 endif
@@ -44,7 +51,7 @@ endif
 ifdef PKG_USB
 DRVNAME    equ  'JAIUSB'
 HDRNAME    equ  'JAIUSB '
-BANNER     equ  'JAIUSB 1.1 - USB driver for DOS with Jemm'
+BANNER     equ  'JAIUSB 1.2 - USB driver for DOS with Jemm'
 COREFILE   equ  'JAIUCORE.DLL'
 VXDFILE    equ  'JAIUSB.386'
 DOSACTIVE  equ  'USB active'
@@ -53,7 +60,7 @@ DEFSLOTS   equ 2
 CORE_POOL  equ 3584 * 1024             ; camera frames and their isochronous buffers (core window: 4 MB)
 elseifdef PKG_AUDIO ; pretty useless for DOS since no port trapping
 DRVNAME    equ  'JAIAUDIO'
-BANNER     equ  'JAIAUDIO 1.1 - HD Audio / AC97 sound driver'
+BANNER     equ  'JAIAUDIO 1.2 - HD Audio / AC97 sound driver'
 COREFILE   equ  'JAIACORE.DLL'
 VXDFILE    equ  'JAIAUDIO.386'
 DOSACTIVE  equ  'sound active in DOS / standard mode'
@@ -64,7 +71,7 @@ else
 PKG_DISK   equ <>
 DRVNAME    equ  'JAIDISK'
 HDRNAME    equ  'JAIDISK'
-BANNER     equ  'JAIDISK 1.1 - IDE/AHCI/NVMe disk driver for DOS'
+BANNER     equ  'JAIDISK 1.2 - IDE/AHCI/NVMe disk driver for DOS'
 COREFILE   equ  'JAIDCORE.DLL'
 VXDFILE    equ  'JAIDISK.386'
 DOSACTIVE  equ  'active'
@@ -72,6 +79,26 @@ DOSACTIVE  equ  'active'
 DEFSLOTS   equ 0
 CORE_POOL  equ 1536 * 1024
 endif
+
+DDT struct	;DOS disk table
+pNext    dd ?	;+0 far16 format
+bPhysU   db ?	;+4 physical unit (80h=hd0, ... )
+bLogU    db ?	;+5 logical unit (0=A:, ... )
+;--- BPB
+bps      dw ?	;+6 bytes/sector
+spc      db ?	;+8 sectors/cluster
+rsvdsec  dw ?	;+9 reserved sectors
+nFats    db ?	;+11 number of FATs
+nrootdir dw ?	;+12 number of root dir entries (0 for FAT32)
+nSectors dw ?	;+14 number of sectors (FAT12)
+md       db ?	;+16 media descriptor
+secfat   dw ?	;+17 sectors/fat
+sectrk   dw ?	;+19 sectors/track
+heads    dw ?	;+21 heads
+hidden   dd ?	;+23 hidden sectors
+;...
+DDT ends
+
 
 FN_INIT         equ 0
 FN_DOS          equ 1
@@ -257,6 +284,21 @@ strategy:
         mov word ptr [cs:reqptr+0], bx
         mov word ptr [cs:reqptr+2], es
         retf
+
+ifdef _DEBUG
+DGROUP group _DStrings
+@dprintf equ <invoke dprintf, >
+CStr macro text:vararg
+local sym
+_DStrings segment
+sym db text,0
+_DStrings ends
+	exitm <offset sym>
+endm
+        include dprintf.inc
+else
+@dprintf equ <;>
+endif
 
 RP struct
 RPHLen	db ?	;+0 Header byte count.
@@ -1558,7 +1600,7 @@ i13entry dd 0
 int13s proc
         cmp dl, 80h
         jb .pass
-        cmp dl, 88h
+        cmp dl, 80h+WIN_MAXBIOSDISKS
         jae .pass
         push bx
         movzx bx, dl
@@ -1576,7 +1618,7 @@ int13s endp
 int13s proc
         cmp dl, 80h
         jb .pass
-        cmp dl, 88h
+        cmp dl, 80h+WIN_MAXBIOSDISKS
         jae .pass
         push bx
         movzx bx, dl
@@ -1958,17 +2000,18 @@ get_biosmap proc
         call callcore
         cmp [i13req.status], 0
         jne .noi13
-        xor si, si
-.ci:    cmp [wbm.disk+si], 0
-        jne .hki13
-        inc si
-        cmp si, 8
+        mov al,0
+        xor bx, bx
+.ci:    cmp [wbm.disk+bx], 0
+        jz @F
+        bts ax,bx
+@@:
+        inc bx
+        cmp bx, 8
         jb .ci
-.noi13:
-        clc
         ret
-.hki13:
-        stc
+.noi13:
+        mov al,0
         ret
 get_biosmap endp
 
@@ -2021,7 +2064,7 @@ do_init proc
         ; CB defaults
         mov [cb.magic], 42433357h
         mov [cb.version], 0101h
-        mov byte ptr [cb.flags], CBF_BUSY
+;        mov byte ptr [cb.flags], CBF_BUSY
         mov [cb.size_], sizeof wincb
         mov byte ptr [cb.mplex], WIN_MPLEX
         mov [cb.slotreq], DEFSLOTS or 80h  ; default: grows with the partitions found
@@ -2110,7 +2153,7 @@ endif
         jc .init_fail
         call read_bios_mbrs
         call read_bds    ; fill cb.mounted[] array
-        mov byte ptr [cb.flags], CBF_DOSCORE
+;        mov byte ptr [cb.flags], CBF_DOSCORE
 
         ; core_init(params)
         mov ax, FN_INIT
@@ -2178,14 +2221,36 @@ ifndef PKG_USB
 endif
 
 ifndef PKG_AUDIO
+ ifdef _DEBUG
+        xor cx, cx
+        lea si, [cb.mounted]
+@@:
+        cmp [si].winmount.biosdrv,0
+        jz .dispdsk_done
+        movzx dx, [si].winmount.letter
+        add dl,'A'
+        @dprintf CStr("mounted[%u]: %c:, hd=%X, start=%lu",10), cx, dx, [si].winmount.biosdrv, [si].winmount.start
+        add si, sizeof winmount
+        inc cx
+        cmp cx,16
+        jb @B
+.dispdsk_done:
+ endif
  if I13BIOSV86
         call get_biosmap
-        jnc @F
+        cmp al,0
+        jz @F
  else
         cmp cb.kbcstat, 0       ;kbcstat abused for int13 flags
         jz @F
         mov eax, cb.vxd_entry   ;vxd_entry abused for int13 callback
         mov i13entry, eax
+        mov al, cb.kbcstat
+ endif
+ if MODDPB
+        call moddpb
+ elseif MODDDT
+        call modddt
  endif
         mov al, 13h
         mov di, offset old13s
@@ -2364,12 +2429,133 @@ hook_irqs endp
 
 endif
 
+if MODDPB
+
+;--- adjust device driver headers in DPBs
+;--- in: BIOS disk bits (80h-87h) in AL
+;--- a) get the DOS drive letter - scan cb.mount[].biosdsk
+;--- b) get the DPB for that drive
+;--- c) the DPB has the device driver header
+
+moddpb proc uses si di
+
+local disks:word
+local dpblist:dword
+local ddofs:word
+
+        mov ah,0
+        mov disks,ax
+
+        mov ah,52h
+        int 21h
+        les bx,es:[bx+0]  ;get start of DPB list
+        mov word ptr dbplist+0,bx
+        mov word ptr dbplist+2,es
+        mov cx,24
+        cmp cb.dosver+1,4
+        jb @F
+        inc cx
+@@:
+        mov ddofs,cx
+
+        mov cx, 0
+nextdisk:
+        bt disks, cx
+        jnc skipdisk
+        mov al,cl
+        call getdosdisk; get DOS drive from BIOS disk
+        jc skipdisk
+        call getdpb    ; get DPB in ES:BX for DOS drive in AL
+        jc skipdisk
+        call moddpb    ; modify DPB in driver header
+skipdisk:
+        inc cx
+        cmp cx, 8
+        jb nextdisk
+
+        inc di
+        cmp di,8
+        jb nextdisk
+done:
+        ret
+
+;--- scan the cb.mounted[] array to get the dos drive (letter)
+;--- in: AL=BIOS disk
+;--- out: AL=DOS drive
+getdosdisk:
+        push cx
+        lea si, cb.mounted
+        mov cx, 16
+        mov dl, al
+nextmount:
+        mov al, [si].winmount.letter
+        cmp dl, [si].winmount.biosdrv
+        jz foundmnt
+        add si, sizeof winmount
+        loop nextmount
+        stc
+foundmnt:
+        pop cx
+        retn
+
+;--- get DPB of DOS drive
+;--- in: DOS drive in AL (0=A, 1=B, ...)
+
+getdpb:        
+        les bx, dbplist
+        cmp word ptr es:[bx+0], -1
+        jz endoflist
+        cmp al,es:[bx+0]
+        jz found
+        add bx, ddofs
+        les bx, es:[bx]
+        jmp nextdpb
+endoflist:
+        stc
+found:
+        retn
+
+moddpb endp
+elseif MODDDT
+
+modddt proc uses ds
+local disks:word
+        mov ah,0
+        mov disks,ax
+        mov ax, 803h
+        int 2Fh
+        mov ax,ds
+        mov cx,cs
+        cmp ax,cx
+        jz .x
+
+.l:     cmp di, -1
+        je .x
+        mov al, [di].DDT.bPhysU
+        cmp al, 80h
+        jb .nx
+        and al,7Fh
+        cmp al,8
+        jae .x
+        mov ah,0
+        bt disks, ax
+        jnc .nx
+        and byte ptr [di+3Fh],not 1    ;reset bit 0; offset is 3Fh for DOS 7.1 only!
+.nx:    lds di, [di].DDT.pNext
+        jmp .l
+.x:
+        ret
+modddt endp
+
+endif
+
 ; ---------------------------------------------------------------------------
 ; es:si -> cmdline
 
 parse_cmdline proc
 
         ; skip the driver path
+        ; todo: if WINAWARE is active, store the path in pathbuf
 .p:     lodsb es:[si]
         cmp al, ' '
         jbe .pe
@@ -2378,6 +2564,9 @@ parse_cmdline proc
         jmp .p
 .pe:
         dec si
+if WINAWARE
+        push si   ;save end of exe path
+endif
 ;--- options
 .o:     lodsb es:[si]
         cmp al, 13
@@ -2433,42 +2622,46 @@ parse_cmdline proc
 .st:    mov [cb.slotreq], al
         jmp .o
 
-.tab:   mov bx, offset optab
-        mov cx, offset cb.opts
-.t:     mov edx, [bx]              ;<---
+.tab:   push si
+        mov si, offset optab
+        mov bx, offset cb.opts
+.t:     lodsd                     ;<--- check next option
+        mov edx, eax
         test edx, edx
         jnz .t1
-        cmp cx, offset cb.opts
+        cmp bx, offset cb.opts
+        pop si
         jne .o
-        mov bx, offset optab2
-        mov cx, offset cb.opts2
+        push si
+        mov si, offset optab2
+        mov bx, offset cb.opts2
         jmp .t
-.t1:    push si
-        lea si, [bx+4]
-        xor di, di
-.cmp:   mov al, [si]
+.t1:    xor di, di
+.cmp:   lodsb
         cmp al, [tok+di]
         jne .ne
         test al, al
         jz .eq
-        inc si
         inc di
         jmp .cmp
-.eq:    pop si
-        mov bx, cx
-        or [bx], edx
-        jmp .o
-.ne:    pop si
-        add bx, 4
-.sk:    mov al, [bx]
-        inc bx 
+.ne:
+        dec si
+.sk:
+        lodsb
         cmp al, 0
         jne .sk
         jmp .t
+.eq:
+        or [bx], edx
+        pop si
+        jmp .o
 .done:
 if WINAWARE
-        mov cx, bx
-        mov si, offset pathbuf
+;--- this code hasn't been tested yet!
+        mov bx, word ptr [cs:reqptr]
+        mov si, word ptr es:[bx].RP.RPCL
+        pop cx
+        sub cx, si
         mov di, offset cb.vxdpath
         rep movsb
         mov si, offset vxdname
@@ -2601,6 +2794,7 @@ endif
 
 ; ---------------------------------------------------------------------------
 
+ifdef PKG_AUDIO
 ; clear the init buffer (BX = bytes)
 clrbuf:
         push es
@@ -2620,7 +2814,6 @@ bufptr: mov esi, cs
         ret
 
 ;---------------------------------------------------------------------------
-ifdef PKG_AUDIO
 ; load_fw: every firmware entry of the control block in state WFW_REQ is read from the
 ; driver directory into its own XMS block (locked, 4K aligned start)
 fwpath          db 128 dup(0)
@@ -2812,8 +3005,11 @@ free_fw proc
 free_fw endp
 endif
 
+;--- check if the JLM has been loaded;
+;--- if yes, alloc memory for "core pool".
+
 load_core proc
-        mov ax,0
+        xor ax,ax
         mov es,ax
         mov bx,3D34h
         mov ax,1684h
@@ -2826,17 +3022,15 @@ load_core proc
         mov word ptr jlmentry+0,di
         mov word ptr jlmentry+2,es
 
-        mov ax, (CORE_POOL + 3*1024) shr 10
-;        mov [emb_kb], ax
-        mov dx, ax
+        mov dx, (CORE_POOL + 4*1024) shr 10
         mov ah, 09h
         call [xmsentry]
-        cmp ax, 1
+        dec ax
         jne .noemb
         mov [emb_handle], dx
         mov ah, 0Ch
         call [xmsentry]
-        cmp ax, 1
+        dec ax
         jne .noemb
         push dx
         push bx
@@ -2851,10 +3045,9 @@ load_core proc
         ret
 .nojlm:
         mov dx, offset msg_nojlm
-        call printdn
-        stc
-        ret
+        jmp .failed
 .noemb: mov dx, offset msg_noemb
+.failed:
         call printdn
         stc
         ret
@@ -2864,31 +3057,29 @@ load_core endp
 read_bios_mbrs proc
         mov ah, 08h
         mov dl, 80h
-        push es
         int 13h
-        pop es
         jc .none
-        cmp dl, 8
+        cmp dl, WIN_MAXBIOSDISKS
         jbe .n
-        mov dl, 8
+        mov dl, WIN_MAXBIOSDISKS
 .n:     mov [cb.nbios], dl
         movzx cx, dl
         jcxz .none
         mov dl, 80h
         mov bx, offset mbrbuf
 .l:     push cx
-        push dx
         push bx
+        push dx
         push cs
         pop es
         mov ax, 0201h
         mov cx, 0001h
         mov dh, 0
         int 13h
-        pop bx
         pop dx
-        pop cx
         call bios_geom
+        pop bx
+        pop cx
         add bx, 512
         inc dl
         loop .l
@@ -2901,8 +3092,7 @@ read_bios_mbrs endp
 ; DL = disk, 80h - max. 87h
 ; INT 13h AH=08h geometry into cb.biosgeom (for the FastDisk of the VxD)
 bios_geom proc
-        pusha
-        push es
+        push dx
         push dx
         mov ah, 08h
         int 13h
@@ -2921,29 +3111,10 @@ bios_geom proc
         mov al, ch
         inc ax
         mov [cb.biosgeom.cyls+bx], ax  ; cylinders
-.x:     pop es
-        popa
+.x:
+        pop dx
         ret
 bios_geom endp
-
-DDT struct	;DOS disk table
-pNext    dd ?	;+0 far16 format
-bPhysU   db ?	;+4 physical unit (80h=hd0, ... )
-bLogU    db ?	;+5 logical unit (0=A:, ... )
-;--- BPB
-bps      dw ?	;+6 bytes/sector
-spc      db ?	;+8 sectors/cluster
-rsvdsec  dw ?	;+9 reserved sectors
-nFats    db ?	;+11 number of FATs
-nrootdir dw ?	;+12 number of root dir entries (0 for FAT32)
-nSectors dw ?	;+14 number of sectors (FAT12)
-md       db ?	;+16 media descriptor
-secfat   dw ?	;+17 sectors/fat
-sectrk   dw ?	;+19 sectors/track
-heads    dw ?	;+21 heads
-hidden   dd ?	;+23 hidden sectors
-;...
-DDT ends
 
 ; partitions DOS already mounted from BIOS disks (INT 2Fh AX=0803h drive data tables)
 
@@ -3014,18 +3185,21 @@ _start:
     int 21h
     mov ax,4c00h
     int 21h
+
+    @idata
 startmsg db "JAIUSB.SYS must be launched by a DEVICE= line in CONFIG.SYS",13,10,'$'
+
 _BSS segment para public 'BSS'
 _BSS ends
 	.data?
 tok     db 16 dup (?)
-mbrbuf  db 8 * 512 dup (?)
+mbrbuf  db WIN_MAXBIOSDISKS * 512 dup (?)
 initbuf db 4096 dup (?)
 else
 startlbl textequ <>
         align 16
 tok     db 16 dup (0)
-mbrbuf  db 8 * 512 dup (0)
+mbrbuf  db WIN_MAXBIOSDISKS * 512 dup (0)
 initbuf label byte
 endif
 

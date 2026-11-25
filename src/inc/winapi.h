@@ -8,7 +8,7 @@
 #define WIN_MAGIC        0x42433357UL    /* 'WINCB' */
 #define WIN_VERSION      0x0100
 
-/* japheth: reduced MAXUNITS, thus sizeof(struct wincb) won't change */
+/* japheth: reduced MAXUNITS, since full FAT32 BPB is now stored */
 //#define WIN_MAXUNITS     24
 #define WIN_MAXUNITS     16
 
@@ -34,6 +34,8 @@
 #endif
 
 #define WIN_BPBXSIZE    25+28 /* new in WinUSB v1.1 */
+
+#define WIN_MAXBIOSDISKS 8
 
 /* unit types / state */
 #define UT_NONE     0
@@ -73,7 +75,7 @@ struct extbpb_s {
 struct winunit {                /* 64 bytes; japheth: added 28 */
     unsigned char  type;        /* UT_xxx */
     unsigned char  state;       /* US_xxx */
-    unsigned char  disk;        /* core disk index, 0xFF none */
+    unsigned char  disk;        /* core disk index (struct blkdev), 0xFF none */
     unsigned char  part;        /* partition number on disk */
     unsigned long  key;         /* disk identity */
     unsigned long  key2;
@@ -89,7 +91,7 @@ struct winunit {                /* 64 bytes; japheth: added 28 */
     unsigned char  label[11];   /* 53: volume label */
 };
 
-/* control block flags */
+/* control block flags - wincb.flags */
 #define CBF_VXD         0x0001  /* VxD active, route requests to vxd_entry */
 #define CBF_DOSCORE     0x0002  /* DOS core image loaded */
 #define CBF_REINIT      0x0004  /* hardware must be re-initialized by DOS core */
@@ -186,9 +188,13 @@ struct wingeom {                 /* BIOS (translated) geometry of a hard disk */
     unsigned char  spt;
 };
 
-/* if offsets change, winstor.asm must be adjusted!!! */
+/* originally, with NASM used as assembler,
+ * if offsets changed, winstor.asm had to be adjusted!
+ * With JWasm, winapi.h is translated to winapi.inc by h2incx -
+ * no more offset "magic numbers"!
+ */
 
-struct wincb {                   /* 2048 bytes, lives in WINDISK.SYS / WINUSB.SYS memory */
+struct wincb {                  /* lives in WINDISK.SYS / WINUSB.SYS memory (originally 2048 bytes) */
     unsigned long  magic;       /* 0 */
     unsigned short version;     /* 4 */
     unsigned short size;        /* 6 */
@@ -199,16 +205,16 @@ struct wincb {                   /* 2048 bytes, lives in WINDISK.SYS / WINUSB.SY
     unsigned char  nfixed;      /* 18 */
     unsigned char  nslots;      /* 19 */
     unsigned long  opts;        /* 20  OPT_* */
-    unsigned long  core_phys;   /* 24 */
-    unsigned long  core_size;   /* 28 */
+    unsigned long  core_phys;   /* 24  DOS binary WINxCORE.BIN */
+    unsigned long  core_size;   /* 28  DOS binary WINxCORE.BIN */
     unsigned short irqmask;     /* 32  IRQs the DOS core wants */
     unsigned short drvseg;      /* 36-2=34 */
     unsigned short mplex;       /* 36 */
     unsigned short dosver;      /* 38 */
-    unsigned long  biosmbr[8];  /* 40  CRC32 of MBR for BIOS disks 80h.. */
-    struct wingeom  biosgeom[8]; /* 72  INT 13h AH=08h geometry of BIOS disks 80h.. */
-    unsigned char  nbios;       /* 104 */
-    unsigned char  nmounted;    /* 105 */
+    unsigned long  biosmbr[WIN_MAXBIOSDISKS];  /* 40  CRC32 of MBR for BIOS disks 80h.. */
+    struct wingeom  biosgeom[WIN_MAXBIOSDISKS]; /* 72  INT 13h AH=08h geometry of BIOS disks 80h.. */
+    unsigned char  nbios;       /* 104 set by real-mode part, drives returned by int 13h */
+    unsigned char  nmounted;    /* 105 set by real-mode part; 0xff for FreeDOS, else disks mounted by BIOS (int 2F, ax=803); see mounted[] below */
     unsigned char  slotreq;     /* 106 requested slots (/R:n); bit 7: the default, which grows with
                                    the partitions of the removable disks found at the start */
     unsigned char  kbcstat;     /* 107 */
@@ -324,9 +330,9 @@ struct core_params {
 #define WINE_NOCORE      6
 
 struct winbiosmap {              /* WINF_BIOSMAP: BIOS disk 80h + k is our disk disk[k] - 1 */
-    unsigned char  disk[8];
-    unsigned long  sectors[8];   /* 512-byte sectors (low 32 bits) */
-    unsigned long  sectorshi[8];
+    unsigned char  disk[WIN_MAXBIOSDISKS];
+    unsigned long  sectors[WIN_MAXBIOSDISKS];   /* 512-byte sectors (low 32 bits) */
+    unsigned long  sectorshi[WIN_MAXBIOSDISKS];
 };
 
 struct winapireq {               /* 32 bytes */

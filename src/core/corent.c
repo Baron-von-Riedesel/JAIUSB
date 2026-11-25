@@ -50,7 +50,7 @@ int __cdecl api_biosmap(struct winbiosmap *m)
     if (plat_mode != PM_DOS || !cb->nbios) return WINE_OK;
     buf = kmalloc_align(4096, 4096);
     if (!buf) return WINE_IO;
-    for (k = 0; k < cb->nbios && k < 8; k++) {
+    for (k = 0; k < cb->nbios && k < WIN_MAXBIOSDISKS; k++) {
         hits = 0;
         hit = -1;
         if (!cb->biosmbr[k]) continue;
@@ -69,6 +69,7 @@ int __cdecl api_biosmap(struct winbiosmap *m)
             m->sectorshi[k] = (u32)(d->sectors >> 32);
             if (!d->shared) d->shared = (u8)(k + 1);
             kprintf("BIOS disk %02xh is disk%d (%s): its INT 13h calls are served here\n", 0x80 + k, hit, d->model);
+            dprintf(("api_biosmap: d=%X, sectors=%X\n", d, m->sectors[k] ));
         }
     }
     kfree(buf);
@@ -89,7 +90,7 @@ static void match_bios_disks(u8 *mbrs)
         if (d->removable) continue;
         if (blk_read_abs(d, 0, 1, buf)) continue;
         c = crc32(0, buf, 512);
-        for (k = 0; k < cb->nbios && k < 8; k++) {
+        for (k = 0; k < cb->nbios && k < WIN_MAXBIOSDISKS; k++) {
             if (cb->biosmbr[k] == c) {
                 d->shared = (u8)(k + 1);
                 kprintf("disk%d is BIOS disk %02xh\n", i, 0x80 + k);
@@ -678,7 +679,7 @@ int core_api(struct winapireq *r)
 #endif
         in->poolfree = pool_free_bytes();
         in->uptime_ms = plat_ms() - start_ms;
-        strlcpy(in->build, "WINDRV 1.2 " __DATE__, sizeof(in->build));
+        strlcpy(in->build, "JAIDRV 1.2 " __DATE__, sizeof(in->build)); /* JAIUSB */
         r->retlen = sizeof(*in);
         return WINE_OK;
     }
@@ -741,11 +742,13 @@ int core_api(struct winapireq *r)
         u64 lba = ((u64)r->arg2 << 32) | r->arg1;
         u32 cnt;
         if (!d || !d->present || d->cdrom) return WINE_NODEV;
+        if (!d->shared) return WINE_NODEV; /* JAIUSB: only BIOS disks */
         if (!buf || !r->buflen || r->buflen % d->ssize) return WINE_SMALL;
         cnt = r->buflen / d->ssize;
         if (cnt > d->maxxfer) cnt = d->maxxfer;
         if (cnt * d->ssize > BOUNCE_SIZE) cnt = BOUNCE_SIZE / d->ssize;
         if (lba >= d->sectors || cnt > d->sectors - lba) return WINE_IO;
+        dprintf(("core_api, WINF_RAWIO(%u): d=%X\n", r->arg0 & 0x7, d ));
         if (wr) {
             if (d->wprot) return WINE_IO;
             memcpy(bounce, buf, cnt * d->ssize);

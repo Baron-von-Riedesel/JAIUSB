@@ -1,6 +1,0 @@
-system dos
-name bjlm/tools/JAIINFO.EXE
-file bjlm/tools/wininfo.obj
-file bjlm/tools/winfmt.obj
-file bjlm/tools/winfs.obj
-option q, m=bjlm/tools/jaiinfo.map, stack=8192

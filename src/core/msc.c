@@ -319,6 +319,7 @@ static void lun_attach(struct msclun *l)
 static void lun_detach(struct msclun *l)
 {
     if (l->registered) {
+        dprintf(("msc.lun_detach(l=%X): &l.bd=%X\n", l, &l->bd));
         blk_unregister(&l->bd);
         l->registered = 0;
     }
@@ -366,6 +367,7 @@ static int msc_probe(struct usb_dev *d, u8 *ifc, u8 *end)
     u8 cdb[6];
     if (ifc[5] != 8) return -1;
     if (cb->opts & OPT_NOMSC) return -1;
+    dprintf(("msc_probe(d=%X)\n", d));
     /* look for the BOT alternate (0x50) and a UAS alternate (0x62) of this interface */
     for (p = ifc; p + 2 <= end && p[0]; p += p[0]) {
         if (p[1] != 4 || p[2] != ifc[2]) continue;
@@ -468,6 +470,7 @@ static int msc_probe(struct usb_dev *d, u8 *ifc, u8 *end)
         strlcpy(l->bd.serial, d->serial, sizeof(l->bd.serial));
         l->bd.key = crc32(crc32(i, d->ddesc + 8, 4), d->serial, strlen(d->serial));
         l->bd.key2 = crc32(0, l->prod, strlen(l->prod));
+        dprintf(("msc_probe: calling lun_attach, l=%X\n", l));
         lun_attach(l);
         l->next_check = plat_ms() + 1000;
     }
@@ -484,6 +487,7 @@ static void msc_detach(struct usb_dev *d)
         for (i = 0; i < m->nluns; i++) {
             if (!m->luns[i]) continue;
             if (m->luns[i]->cd) cd_unregister(m->luns[i]->cd);
+            dprintf(("msc_detach: calling lun_detach(l=%X)\n", m->luns[i]));
             lun_detach(m->luns[i]);
             kfree(m->luns[i]);
         }
@@ -511,15 +515,20 @@ void msc_tick(void)
             memset(cdb, 0, 6);
             r = scsi(l, cdb, 6, NULL, 0, 0, 3000);
             if (r == SCSI_OK && !l->registered) {
+                dprintf(("msc_tick: calling lun_attach r=SCSI_OK\n"));
                 lun_attach(l);
             } else if (r == 6 && l->registered) {
                 /* unit attention: medium may have changed */
+                dprintf(("msc_tick: calling lun_detach r=6, registered\n"));
                 lun_detach(l);
+                dprintf(("msc_tick: calling lun_attach r=6, registered\n"));
                 lun_attach(l);
             } else if (r == 2 && l->registered) {
+                dprintf(("msc_tick: calling lun_detach r=2, registered\n"));
                 kprintf("msc: LUN %d medium removed\n", l->lun);
                 lun_detach(l);
             } else if (r == 6 && !l->registered) {
+                dprintf(("msc_tick: calling lun_attach r=6\n"));
                 lun_attach(l);
             }
         }
@@ -539,6 +548,7 @@ int msc_eject(struct usb_dev *d)
             if (!l) continue;
             if (l->registered) {
                 if (msc_flush(&l->bd)) rc = -1;
+                dprintf(("msc_eject: calling lun_detach(l=%X)\n", l));
                 lun_detach(l);
             }
             memset(cdb, 0, 6);

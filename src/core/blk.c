@@ -487,9 +487,14 @@ static u32 disk_key2(struct blkdev *d)
     return d->key2;
 }
 
+/* called by blk_scan_fixed()
+ * - type may be UT_FIXED or UT_SLOT
+ */
+
 static int add_unit(int type, struct blkdev *d, struct pent *p, int partno)
 {
     struct winunit *u;
+    dprintf(("add_unit(type=%u, d=%X, partno=%u)\n", type, d, partno));
     if (cb->nunits >= WIN_MAXUNITS) return -1;
     if (cb->firstdrive + cb->nunits >= 26) return -1;
     u = &cb->units[cb->nunits];
@@ -526,7 +531,7 @@ void blk_scan_fixed(void)
     if (scanned) return;
     scanned = 1;
     cb->nunits = 0;
-    dprintf(("blk_scan_fixed: enter\n"));
+    dprintf(("blk_scan_fixed: enter, ndisks=%u\n", ndisks));
     if (cb->opts2 & OPT2_NODISK) {
         kprintf("no DOS drive letters (MS-DOS 7: Windows owns the disks, /DOSDISK for DOS)\n");
         cb->nfixed = cb->nslots = 0;
@@ -535,7 +540,9 @@ void blk_scan_fixed(void)
     for (i = 0; i < ndisks; i++) {
         struct blkdev *d = disks[i];
         dprintf(("blk_scan_fixed(%u): removable=%u cdrom=%u kind=%u shared=%u\n", i, d->removable, d->cdrom, d->kind, d->shared));
+
         if (d->removable || d->cdrom) continue;
+
         if (d->kind == DK_IDE && d->shared) {
             /* the IDE channel belongs to the BIOS (and to WDCTRL in Windows) */
             kprintf("disk%d: %s on a BIOS IDE channel, skipped\n", i, d->model);
@@ -572,6 +579,7 @@ void blk_scan_fixed(void)
     if (nslots > WIN_MAXUNITS - cb->nunits) nslots = WIN_MAXUNITS - cb->nunits;
     if (nslots > 26 - cb->firstdrive - cb->nunits) nslots = 26 - cb->firstdrive - cb->nunits;
     if (nslots < 0) nslots = 0;
+    dprintf(("blk_scan_fixed(): nslots=%u, cb.nfixed=%u, cb.slotreq=%u\n", nslots, cb->nfixed, cb->slotreq ));
     for (i = 0; i < nslots; i++)
         if (add_unit(UT_SLOT, NULL, NULL, 0) < 0) break;
     cb->nslots = (u8)(cb->nunits - cb->nfixed);
@@ -615,8 +623,8 @@ static void match_bios(struct blkdev *d)
     u32 c;
     if (d->shared || !cb->nbios || blk_read_abs(d, 0, 1, bounce)) return;
     c = crc32(0, bounce, 512);
-    DBG("disk%d: first sector %08lx, BIOS disks %08lx %08lx\n", disk_index(d), c, cb->biosmbr[0], cb->biosmbr[1]);
-    for (k = 0; k < cb->nbios && k < 8; k++)
+    DBG("match_bios: disk%d: first sector crc=%08lx, BIOS disks crcs:%08lx %08lx\n", disk_index(d), c, cb->biosmbr[0], cb->biosmbr[1]);
+    for (k = 0; k < cb->nbios && k < WIN_MAXBIOSDISKS; k++)
         if (cb->biosmbr[k] == c) {
             d->shared = (u8)(k + 1);
             kprintf("disk%d is BIOS disk %02xh\n", disk_index(d), 0x80 + k);
@@ -629,12 +637,14 @@ static int slot_attach(struct blkdev *d)
     struct pent pe[16];
     int n, j, i, used = 0;
     if (!cb->nunits || !blk_dosunits) return 0;     /* no DOS drive letters (Plug and Play: IOS owns the disks) */
+    dprintf(("blk.slot_attach(%u): enter, d=%X\n", disk_index(d), d));
     match_bios(d);
     n = scan_parts(d, pe, 16, 1);
     if (n <= 0) {
         kprintf("disk%d: no volume DOS can use\n", disk_index(d));
         return 0;
     }
+    dprintf(("slot_attach(%u): %u partitions\n", disk_index(d), n));
     for (j = 0; j < n; j++) {
         int pick = -1;
         if (bios_mounted(d, pe[j].start)) {
@@ -678,13 +688,18 @@ static int slot_attach(struct blkdev *d)
             used++;
         }
     }
+    dprintf(("slot_attach(%u): exit\n", disk_index(d)));
     return used;
 }
+
+#if 1 /* JAIUSB */
+extern void __cdecl plat_disk_change( int, int );
+#endif
 
 int blk_register(struct blkdev *d)
 {
     int i = disk_index(d);
-    dprintf(("blk_register i=%d, ndisks=%u, d->removable=%u scanned=%u\n", i, ndisks, d->removable, scanned));
+    dprintf(("blk_register(idx=%d, d=%X ): ndisks=%u, d->removable=%u scanned=%u\n", i, d, ndisks, d->removable, scanned));
     if (i < 0) {
         if (ndisks >= MAXDISKS) return -1;
         /* reuse a hole left by an unplugged disk */
@@ -693,6 +708,9 @@ int blk_register(struct blkdev *d)
     }
     d->index = (u8)i;
     if (!d->maxxfer) d->maxxfer = 128;
+#if 1 /* JAIUSB: if BIOS disk, notify jlment.c */
+    if ( d->shared ) plat_disk_change(i, 1);
+#endif
     if (d->removable && scanned) slot_attach(d);
     else if (!d->removable && scanned) {
         /* VxD side: bind fixed units created by the DOS core */
@@ -708,6 +726,7 @@ int blk_register(struct blkdev *d)
 void blk_unregister(struct blkdev *d)
 {
     int i = disk_index(d), k;
+    dprintf(("blk.blk_unregister(d=%X, idx=%d)\n", d, i ));
     if (i < 0) return;
     for (k = 0; k < cb->nunits; k++) {
         struct winunit *u = &cb->units[k];
@@ -721,6 +740,9 @@ void blk_unregister(struct blkdev *d)
             }
         }
     }
+#if 1 /* JAIUSB: if BIOS disk, notify jlment.c */
+    if ( d->shared ) plat_disk_change(i, 0);
+#endif
     /* keep the array dense: move the last disk into the hole and fix unit links */
     ndisks--;
     if (i != ndisks) {
@@ -820,8 +842,8 @@ static int dos_rw(u8 *pkt, struct winunit *u, int wr)
     u32 start = *(u16 *)(pkt + 0x14);
     u8 *buf = plat_rm(*(u32 *)(pkt + 0x0E));
     int r;
-    dprintf(("dos_rw, u=%X\n", u));
     if (start == 0xFFFF && pkt[0] >= 0x1E) start = *(u32 *)(pkt + 0x1A);
+    dprintf(("dos_rw( u=%X, wr=%u): start=%u, cnt=%u, buf=%X\n", u, wr, start, cnt, buf));
     if (!d || !(u->state & US_PRESENT)) {
         *(u16 *)(pkt + 0x12) = 0;
         setst(pkt, ST_ERR | ST_DONE | E_NOTREADY);
@@ -891,6 +913,16 @@ static int dos_ioctl(u8 *pkt, struct winunit *u)
     geom(u, &heads, &spt, &cyl);
     switch (fn) {
     case 0x60:  /* get device parameters */
+        /* structure of parameter block:
+         * +0: byte, special flags
+         * +1: byte, device type (5 for HD)
+         * +2: word, device attributes (bit 0: 1=removable, bit 1: 1=door lock)
+         * +4: word, cylinders
+         * +6: byte, media type (always 0)
+         * +7: 31 bytes device BPB (cat 08)
+         * +7: 53 bytes extended BPB (cat 48)
+         * +x: sectors/track +sector table
+         */
         p[1] = 5;                                   /* hard disk */
         *(u16 *)(p + 2) = (u->type == UT_FIXED) ? 1 : 2;   /* nonremovable / changeline */
         *(u16 *)(p + 4) = cyl;
@@ -974,9 +1006,9 @@ int blk_dos_request(u8 *pkt)
         return 0;
     }
     u = &cb->units[unit];
-    dprintf(("blk_dos_request(u=%X), cmd=%X\n", u, cmd));
+    dprintf(("blk_dos_request(cmd=%X, unit=%u [u=%X])\n", cmd, unit, u));
     switch (cmd) {
-    case 0x01:  /* media check */
+    case 0x01:  /* media check; return: 1=media hasn't changed, 0xff=media has changed, 0=don't know */
         if (u->type == UT_FIXED) {
             pkt[0x0E] = 1;
         } else if (u->state & US_CHANGED) {
@@ -1017,6 +1049,7 @@ int blk_dos_request(u8 *pkt)
         setst(pkt, ST_DONE);
         return 0;
     case 0x0F:  /* removable media */
+        dprintf(("blk_dos_request: removable media, u.type=%X\n", u->type));
         setst(pkt, u->type == UT_FIXED ? (ST_DONE | ST_BUSY) : ST_DONE);
         return 0;
     case 0x13:
@@ -1031,7 +1064,13 @@ int blk_dos_request(u8 *pkt)
     case 0x19:  /* ioctl query */
     {
         u8 fn = pkt[0x0E];
-        /* japheth: added category 0x48 */
+        /* japheth: added category 0x48
+         * 0x40/0x60: set/get device parameters
+         * 0x41/0x61: write/read logical device track
+         * 0x42/0x62: format/verify logical device track
+         * 0x46/0x66: set/get volume serial number
+         * 0x47/0x67: set/get access flag
+         */
         if ((pkt[0x0D] == 0x08 || pkt[0x0D] == 0x48 ) &&
             (fn == 0x40 || fn == 0x41 || fn == 0x42 || fn == 0x46 || fn == 0x47 ||
              fn == 0x60 || fn == 0x61 || fn == 0x62 || fn == 0x66 || fn == 0x67))

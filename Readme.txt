@@ -65,7 +65,8 @@
 
    If USB support for mass storage is enabled in the BIOS, JAIUSB will
   take over the drive letters of the USB disks mounted by the BIOS.
-  However, hot-plugin won't work for such disks.
+  Hot-plugin won't work for such disks. OTOH, those drives are known to
+  disk interrupt 13h, so FDISK will see them and they can be partitioned.
 
    If the so-called "legacy support" is disabled and no PS/2 keyboard is
   attached, be aware that you won't be able to navigate in a GRUB or MS-DOS
