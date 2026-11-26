@@ -623,7 +623,8 @@ static void match_bios(struct blkdev *d)
     u32 c;
     if (d->shared || !cb->nbios || blk_read_abs(d, 0, 1, bounce)) return;
     c = crc32(0, bounce, 512);
-    DBG("match_bios: disk%d: first sector crc=%08lx, BIOS disks crcs:%08lx %08lx\n", disk_index(d), c, cb->biosmbr[0], cb->biosmbr[1]);
+    //DBG("match_bios: disk%d: first sector crc=%08lx, BIOS disks crcs:%08lx %08lx\n", disk_index(d), c, cb->biosmbr[0], cb->biosmbr[1]);
+    dprintf(("match_bios: disk%d: first sector crc=%08lx, BIOS disks crcs:%08lx %08lx\n", disk_index(d), c, cb->biosmbr[0], cb->biosmbr[1]));
     for (k = 0; k < cb->nbios && k < WIN_MAXBIOSDISKS; k++)
         if (cb->biosmbr[k] == c) {
             d->shared = (u8)(k + 1);
@@ -699,7 +700,7 @@ extern void __cdecl plat_disk_change( int, int );
 int blk_register(struct blkdev *d)
 {
     int i = disk_index(d);
-    dprintf(("blk_register(idx=%d, d=%X ): ndisks=%u, d->removable=%u scanned=%u\n", i, d, ndisks, d->removable, scanned));
+    dprintf(("blk_register(idx=%d, d=%X): ndisks=%u, d->removable=%u d->shared=%u\n", i, d, ndisks, d->removable, d->shared));
     if (i < 0) {
         if (ndisks >= MAXDISKS) return -1;
         /* reuse a hole left by an unplugged disk */
@@ -708,9 +709,6 @@ int blk_register(struct blkdev *d)
     }
     d->index = (u8)i;
     if (!d->maxxfer) d->maxxfer = 128;
-#if 1 /* JAIUSB: if BIOS disk, notify jlment.c */
-    if ( d->shared ) plat_disk_change(i, 1);
-#endif
     if (d->removable && scanned) slot_attach(d);
     else if (!d->removable && scanned) {
         /* VxD side: bind fixed units created by the DOS core */
@@ -720,13 +718,16 @@ int blk_register(struct blkdev *d)
             if (u->type == UT_FIXED && u->key == d->key && u->key2 == d->key2) u->disk = (u8)i;
         }
     }
+#if 1 /* JAIUSB: if BIOS disk, notify jlment.c; d->shared set only AFTER slot_attach()! */
+    if ( d->shared ) plat_disk_change(d->shared, i+1);
+#endif
     return i;
 }
 
 void blk_unregister(struct blkdev *d)
 {
     int i = disk_index(d), k;
-    dprintf(("blk.blk_unregister(d=%X, idx=%d)\n", d, i ));
+    dprintf(("blk_unregister(idx=%d, d=%X): ndisks=%u, d->removable=%u d->shared=%u\n", i, d, ndisks, d->removable, d->shared));
     if (i < 0) return;
     for (k = 0; k < cb->nunits; k++) {
         struct winunit *u = &cb->units[k];
@@ -741,13 +742,16 @@ void blk_unregister(struct blkdev *d)
         }
     }
 #if 1 /* JAIUSB: if BIOS disk, notify jlment.c */
-    if ( d->shared ) plat_disk_change(i, 0);
+    if ( d->shared ) plat_disk_change(d->shared, 0);
 #endif
     /* keep the array dense: move the last disk into the hole and fix unit links */
     ndisks--;
     if (i != ndisks) {
         disks[i] = disks[ndisks];
         disks[i]->index = (u8)i;
+#if 1
+        if ( disks[i]->shared ) plat_disk_change(disks[i]->shared, i+1);
+#endif
         for (k = 0; k < cb->nunits; k++)
             if (cb->units[k].disk == ndisks) cb->units[k].disk = (u8)i;
     }
@@ -1006,7 +1010,7 @@ int blk_dos_request(u8 *pkt)
         return 0;
     }
     u = &cb->units[unit];
-    dprintf(("blk_dos_request(cmd=%X, unit=%u [u=%X])\n", cmd, unit, u));
+    dprintf(("blk_dos_request(cmd=%X, unit=%u [u=%X, u->disk=%u-%X])\n", cmd, unit, u, u->disk, blk_get(u->disk)));
     switch (cmd) {
     case 0x01:  /* media check; return: 1=media hasn't changed, 0xff=media has changed, 0=don't know */
         if (u->type == UT_FIXED) {

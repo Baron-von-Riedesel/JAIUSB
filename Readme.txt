@@ -32,15 +32,16 @@
             increase if more disks are attached.
   /NOMSC    disables mass storage support
   /NOHID    no keyboard / mouse support
-  /NOKBC    no 8042 injection in DOS
+  /NOKBC    no 8042 injection in DOS; should be set if a PS/2 keyboard
+            is attached, but unable to send key codes.
   /V        verbose
   /D        debug log on
   /COM1     log to COM1
   /S        the driver log is copied to the screen
   /POLL     no controller interrupts, polling only (for IRQ problems)
-  /NOPOLL   use controller interrupts, even if they're shared. In this
-            mode JAIUSB will use less CPU resources; in rare cases there
-            might be problems with it.
+  /NOPOLL   controllers will use interrupts, even if they're shared. In this
+            mode JAIUSB will use less CPU resources; IOW, if no problems
+            arise with this setting, it's the recommended one.
   /NORELOC  do not move PCI resources from above 4 GB at boot
   /ALL4G    move every PCI device below 4 GB at boot
   /NOXHCI   leave controllers of that kind to the BIOS
@@ -64,9 +65,11 @@
   4. Hints
 
    If USB support for mass storage is enabled in the BIOS, JAIUSB will
-  take over the drive letters of the USB disks mounted by the BIOS.
-  Hot-plugin won't work for such disks. OTOH, those drives are known to
-  disk interrupt 13h, so FDISK will see them and they can be partitioned.
+  adopt the drive letters of the USB disks mounted by the BIOS. Hot-plugin
+  won't work for such disks. OTOH, the drives are known to disk interrupt 13h,
+  so FDISK will see them and they can be partitioned.
+   DOS sees "BIOS disks" as fixed disks - so one should be aware that, as
+  default, MS SmartDrive will cache both read and write accesses. 
 
    If the so-called "legacy support" is disabled and no PS/2 keyboard is
   attached, be aware that you won't be able to navigate in a GRUB or MS-DOS
@@ -94,7 +97,8 @@
 
    Tool h2incX is to be found in the tools directory. It translates file
   winapi.h to winapi.inc, hence it's only needed if file winapi.h has been
-  changed.
+  changed. It's a Win32 binary, but may run in DOS with the help of the HX
+  DOS extender.
 
 
   7. License

@@ -40,9 +40,6 @@ DEFERRED equ 0	;1=defer IRQs if status is unsafe
 TPMODE   equ 0	;1=support touchpad mode for irq 12
 PROTI13  equ 0	;1=protect int 13h
 
-MODDPB   equ 0	;1=modify device driver header in DPB for BIOS disks [untested]
-MODDDT   equ 0	;1=modify dos disk table
-
 ifdef PKG_USB
 WIN_USB equ <>	;needed by winapi.inc
 endif
@@ -79,26 +76,6 @@ DOSACTIVE  equ  'active'
 DEFSLOTS   equ 0
 CORE_POOL  equ 1536 * 1024
 endif
-
-DDT struct	;DOS disk table
-pNext    dd ?	;+0 far16 format
-bPhysU   db ?	;+4 physical unit (80h=hd0, ... )
-bLogU    db ?	;+5 logical unit (0=A:, ... )
-;--- BPB
-bps      dw ?	;+6 bytes/sector
-spc      db ?	;+8 sectors/cluster
-rsvdsec  dw ?	;+9 reserved sectors
-nFats    db ?	;+11 number of FATs
-nrootdir dw ?	;+12 number of root dir entries (0 for FAT32)
-nSectors dw ?	;+14 number of sectors (FAT12)
-md       db ?	;+16 media descriptor
-secfat   dw ?	;+17 sectors/fat
-sectrk   dw ?	;+19 sectors/track
-heads    dw ?	;+21 heads
-hidden   dd ?	;+23 hidden sectors
-;...
-DDT ends
-
 
 FN_INIT         equ 0
 FN_DOS          equ 1
@@ -138,7 +115,7 @@ endif
 	.code _RDATA
 ; ---------------------------------------------------------------------------
 ; resident data
-reqptr          dd 0	;DOS request header
+reqptr  dd 0	;DOS request header
 
 ;--- oldvecs must match order of hooks
 OVENT = 0
@@ -188,9 +165,6 @@ endif
 if WINAWARE
 handover        db 0	; Windows enhanced mode owns the hardware
 endif
-;dos_usb         db 0	;USB in DOS? Always active!
-;mplex           db WIN_MPLEX
-;tickdiv         db 0	;
 
 if WINAWARE
 ; INT 33h mouse driver state (the standard DOS mouse API, used by DOS programs and by the
@@ -300,17 +274,23 @@ else
 @dprintf equ <;>
 endif
 
+RPHDR struct
+HdrLen  db ?	;+0 Header byte count
+SubUnit db ?	;+1 Subunit number
+Cmd     db ?	;+2 Opcode
+Status  dw ?	;+3 Status word
+        db 8 dup (?)
+RPHDR ends
+
+;--- request packet structure for init call
+
 RP struct
-RPHLen	db ?	;+0 Header byte count.
-RPSubU	db ?	;+1 Subunit number.
-RPOp	db ?	;+2 Opcode.
-RPStat	dw ?	;+3 Status word.
-		db 8 dup (?)	;(Unused by us).
-RPUnit	db ?	;+13 Number of units found.
-RPLen	dw ?	;+14 Resident driver 32-bit length.
-RPSeg	dw ?	;+16 (Segment must ALWAYS be set!).
-RPCL	dd ?	;+18 Command-line and BPB pointer.
-RPDN	db ?	;+22 Drive number (0 = A: etc.).
+        RPHDR <>
+RPUnit  db ?	;+13 Number of units found.
+RPLen   dw ?	;+14 Resident driver 32-bit length.
+RPSeg   dw ?	;+16 (Segment must ALWAYS be set!).
+RPCL    dd ?	;+18 Command-line and BPB pointer.
+RPDN    db ?	;+22 Drive number (0 = A: etc.).
 RP ends
 
 interrupt proc
@@ -340,18 +320,18 @@ endif
         push es
         push bx
         les bx, [cs:reqptr]
-        cmp [es:bx].RP.RPOp, 0
+        cmp [es:bx].RPHDR.Cmd, 0
         jne .notinit
         jmp do_init
 .notinit:
 ifndef PKG_USB
         test word ptr [cs:cb.flags], CBF_CHARDEV
         jz .blockreq
-        mov [es:bx].RP.RPStat, 8103h       ; character device without functions
+        mov [es:bx].RPHDR.Status, 8103h       ; character device without functions
         jmp .done
 .blockreq:
 endif
-        mov [es:bx].RP.RPStat, 0100h
+        mov [es:bx].RPHDR.Status, 0100h
 if WINAWARE
         test byte ptr [cs:cb.flags], CBF_VXD
         jnz .vxd
@@ -383,7 +363,7 @@ if WINAWARE
 endif
 .fail:
         les bx, [cs:reqptr]
-        mov [es:bx].RP.RPStat, 810Ch       ; error, done, general failure
+        mov [es:bx].RPHDR.Status, 810Ch       ; error, done, general failure
 .done:
 if KQV86
         call [cs:pkq_drain]	;DOS driver interrupt proc
@@ -2049,7 +2029,7 @@ do_init proc
         mov [es:bx].RP.RPUnit, 0
         mov [es:bx].RP.RPLen, 0
         mov [es:bx].RP.RPSeg, cs
-        mov [es:bx].RP.RPStat, 810Ch
+        mov [es:bx].RP.Status, 810Ch
         push ax
         call is386
         pop ax
@@ -2247,11 +2227,6 @@ ifndef PKG_AUDIO
         mov i13entry, eax
         mov al, cb.kbcstat
  endif
- if MODDPB
-        call moddpb
- elseif MODDDT
-        call modddt
- endif
         mov al, 13h
         mov di, offset old13s
         mov dx, offset int13s
@@ -2345,7 +2320,7 @@ endif
         mov word ptr [es:bx].RP.RPCL+2, cs
 .init_ok:
         mov [es:bx].RP.RPLen, offset resident_end
-        mov [es:bx].RP.RPStat, 0100h
+        mov [es:bx].RP.Status, 0100h
 ;        jmp .init_ret
 .init_fail:
         ; nothing to do, request packet fields set already
@@ -2426,126 +2401,6 @@ hook_irqs proc
         jb .l
         ret
 hook_irqs endp
-
-endif
-
-if MODDPB
-
-;--- adjust device driver headers in DPBs
-;--- in: BIOS disk bits (80h-87h) in AL
-;--- a) get the DOS drive letter - scan cb.mount[].biosdsk
-;--- b) get the DPB for that drive
-;--- c) the DPB has the device driver header
-
-moddpb proc uses si di
-
-local disks:word
-local dpblist:dword
-local ddofs:word
-
-        mov ah,0
-        mov disks,ax
-
-        mov ah,52h
-        int 21h
-        les bx,es:[bx+0]  ;get start of DPB list
-        mov word ptr dbplist+0,bx
-        mov word ptr dbplist+2,es
-        mov cx,24
-        cmp cb.dosver+1,4
-        jb @F
-        inc cx
-@@:
-        mov ddofs,cx
-
-        mov cx, 0
-nextdisk:
-        bt disks, cx
-        jnc skipdisk
-        mov al,cl
-        call getdosdisk; get DOS drive from BIOS disk
-        jc skipdisk
-        call getdpb    ; get DPB in ES:BX for DOS drive in AL
-        jc skipdisk
-        call moddpb    ; modify DPB in driver header
-skipdisk:
-        inc cx
-        cmp cx, 8
-        jb nextdisk
-
-        inc di
-        cmp di,8
-        jb nextdisk
-done:
-        ret
-
-;--- scan the cb.mounted[] array to get the dos drive (letter)
-;--- in: AL=BIOS disk
-;--- out: AL=DOS drive
-getdosdisk:
-        push cx
-        lea si, cb.mounted
-        mov cx, 16
-        mov dl, al
-nextmount:
-        mov al, [si].winmount.letter
-        cmp dl, [si].winmount.biosdrv
-        jz foundmnt
-        add si, sizeof winmount
-        loop nextmount
-        stc
-foundmnt:
-        pop cx
-        retn
-
-;--- get DPB of DOS drive
-;--- in: DOS drive in AL (0=A, 1=B, ...)
-
-getdpb:        
-        les bx, dbplist
-        cmp word ptr es:[bx+0], -1
-        jz endoflist
-        cmp al,es:[bx+0]
-        jz found
-        add bx, ddofs
-        les bx, es:[bx]
-        jmp nextdpb
-endoflist:
-        stc
-found:
-        retn
-
-moddpb endp
-elseif MODDDT
-
-modddt proc uses ds
-local disks:word
-        mov ah,0
-        mov disks,ax
-        mov ax, 803h
-        int 2Fh
-        mov ax,ds
-        mov cx,cs
-        cmp ax,cx
-        jz .x
-
-.l:     cmp di, -1
-        je .x
-        mov al, [di].DDT.bPhysU
-        cmp al, 80h
-        jb .nx
-        and al,7Fh
-        cmp al,8
-        jae .x
-        mov ah,0
-        bt disks, ax
-        jnc .nx
-        and byte ptr [di+3Fh],not 1    ;reset bit 0; offset is 3Fh for DOS 7.1 only!
-.nx:    lds di, [di].DDT.pNext
-        jmp .l
-.x:
-        ret
-modddt endp
 
 endif
 
@@ -3115,6 +2970,25 @@ bios_geom proc
         pop dx
         ret
 bios_geom endp
+
+DDT struct	;DOS disk table
+pNext    dd ?	;+0 far16 format
+bPhysU   db ?	;+4 physical unit (80h=hd0, ... )
+bLogU    db ?	;+5 logical unit (0=A:, ... )
+;--- BPB
+bps      dw ?	;+6 bytes/sector
+spc      db ?	;+8 sectors/cluster
+rsvdsec  dw ?	;+9 reserved sectors
+nFats    db ?	;+11 number of FATs
+nrootdir dw ?	;+12 number of root dir entries (0 for FAT32)
+nSectors dw ?	;+14 number of sectors (FAT12)
+md       db ?	;+16 media descriptor
+secfat   dw ?	;+17 sectors/fat
+sectrk   dw ?	;+19 sectors/track
+heads    dw ?	;+21 heads
+hidden   dd ?	;+23 hidden sectors
+;...
+DDT ends
 
 ; partitions DOS already mounted from BIOS disks (INT 2Fh AX=0803h drive data tables)
 

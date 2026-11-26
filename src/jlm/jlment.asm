@@ -22,6 +22,7 @@ sym db text,0
 	exitm <offset sym>
 endm
 kprintf proto fastcall :ptr, :vararg
+;--- note: @dprintf won't preserve all registers, eax/ecx/edx are changed!
 @dprintf equ <invoke kprintf, >
 else
 @dprintf equ <;>
@@ -33,8 +34,6 @@ POLLV86   equ 0
 IRQV86    equ 0
 INT15V86  equ 1	;must be 1, 0 not impl.
 I13BIOSV86 equ 0;1=handle disks mounted by BIOS in v86
-
-DISKCHANGE equ 1
 
 externdef c ent_init:near
 externdef c ent_dos:near
@@ -182,47 +181,33 @@ endif
 
 ife I13BIOSV86
 wbm      winbiosmap <>
- if DISKCHANGE
-bStat db -1
- endif
 i13stat  db WIN_MAXBIOSDISKS dup (0)   ;last status, returned by int13, ah=
 endif
 
 	.code
 
-if 1
-plat_disk_change proc c idx:dword, stat:byte
-	@dprintf CStr("plat_disk_change(idx=%d, stat=%u)",10), idx, stat
+plat_disk_change proc c idx:dword, unit:dword
 	mov eax, idx
-	inc eax
-	mov ecx, WIN_MAXBIOSDISKS
-@@:
-	mov edx, offset wbm.disk
-	cmp al, [edx]
-	jz found
-	inc edx
-	loop @B
-	ret
-found:
-	sub edx, offset wbm.disk
-	cmp stat,0
-	jnz @F
-	btr dword ptr bStat, edx
-	ret
-@@:
-	bts dword ptr bStat, edx
+	dec eax
+	cmp eax, lengthof wbm.disk
+	jae inval
+	mov edx, unit
+	mov [wbm.disk+eax], dl
+	@dprintf CStr("plat_disk_change(idx=%u, disk=%u)",10), eax, edx
+inval:
 	ret
 plat_disk_change endp
-endif
 
 ife I13BIOSV86
 
 int13 proc uses ebx esi edi
         @VMMCall Simulate_Iret
-        @dprintf CStr("int13(ax=%X)",10), [ebp].Client_Reg_Struc.Client_EAX
+        @dprintf CStr("int13(ax=%X, dl=%X)",10), word ptr [ebp].Client_Reg_Struc.Client_EAX, byte ptr [ebp].Client_Reg_Struc.Client_EDX
         mov ah, byte ptr [ebp].Client_Reg_Struc.Client_EAX+1
         movzx esi, byte ptr [ebp].Client_Reg_Struc.Client_EDX
         and esi, 7Fh
+        cmp ah, 00h
+        je is_reset
         cmp ah, 02h
         je is_chs
         cmp ah, 03h
@@ -235,7 +220,7 @@ int13 proc uses ebx esi edi
         je is_geom
         cmp ah, 15h
         je is_type
-if 0;DISKCHANGE
+if 0
         cmp ah, 16h
         je is_querychange
 endif
@@ -269,6 +254,14 @@ is_err:  ; AL = status
         or  [ebp].Client_Reg_Struc.Client_EFlags, 1
 is_ret:
         ret
+
+;--- AH=00
+
+is_reset:
+        mov al,80h
+        cmp [wbm.disk+esi], 0
+        jz is_err
+        jmp is_ok
 
 ;--- AH=02/03
 ;--- in: AL sectors
@@ -388,7 +381,7 @@ is_type: mov edi, esi
         mov ax, word ptr [wbm.sectors+edi+0]
         mov word ptr [ebp].Client_Reg_Struc.Client_EDX, ax
         mov [i13stat+esi], 0
-if 0;DISKCHANGE
+if 0
         mov byte ptr [ebp].Client_Reg_Struc.Client_EAX+1, 2         ; AH = 2: removable with change line support
 else
         mov byte ptr [ebp].Client_Reg_Struc.Client_EAX+1, 3         ; AH = 3: fixed disk
@@ -396,7 +389,7 @@ endif
         and [ebp].Client_Reg_Struc.Client_EFlags, not 1
         jmp is_ret
 
-if 0;DISKCHANGE
+if 0
 
 ;--- AH=16h
 ;--- out: AH=0, NC : no change
@@ -503,8 +496,9 @@ i13xfer proc
         sub esp, sizeof winapireq
         push ebx
 if 1
-        bt dword ptr bStat, esi
-        jnc is_err
+        cmp [wbm.disk+esi], 0
+        mov al,80h
+        jz is_x
 endif
         xor ecx, ecx
 is_lp:  cmp [esp].I13FR.SecsLeft, 0
@@ -519,9 +513,7 @@ is_lp:  cmp [esp].I13FR.SecsLeft, 0
         and bx, 0Fh
         mov dx, bx     ; EDX=normalized address
 
-        movzx ebx, byte ptr [ebp].Client_Reg_Struc.Client_EDX
-        and ebx, 7Fh
-        movzx eax, [wbm.disk+ebx]  ; this is the 1-based index for disks[] in blk.c
+        movzx eax, [wbm.disk+esi]
         dec eax
         test [ebp].Client_Reg_Struc.Client_EAX+1, 1   ;02/03/42/43
         je is_rd
